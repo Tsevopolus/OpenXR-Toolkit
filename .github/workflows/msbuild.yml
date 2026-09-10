@@ -1,0 +1,50 @@
+name: MSBuild
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch:
+
+env:
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout project
+      uses: actions/checkout@v4
+
+    - name: Checkout submodules
+      run: git submodule update --init
+
+    - name: Setup DevEnv
+      uses: seanmiddleditch/gha-setup-vsdevenv@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.8"
+
+    - name: Restore NuGet packages
+      run: nuget restore OpenXR-Toolkit.sln
+
+    - name: Build toolkit DLL
+      run: msbuild XR_APILAYER_NEWKITONTHEBLOCK_toolkit\XR_APILAYER_NEWKITONTHEBLOCK_toolkit.vcxproj /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform=x64
+
+    - name: Build companion app
+      run: msbuild companion\companion.csproj /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform=AnyCPU
+
+    - name: Publish build output
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-output
+        path: |
+          bin/x64/Release/XR_APILAYER_NEWKITONTHEBLOCK_toolkit.dll
+          bin/x64/Release/companion.exe
+        if-no-files-found: warn
