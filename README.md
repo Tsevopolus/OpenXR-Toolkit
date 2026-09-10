@@ -2,7 +2,7 @@
 
 This is a personal, community-shared fork of [OpenXR Toolkit](https://github.com/mbucchia/OpenXR-Toolkit) by Matthieu Bucchianeri, distributed under the same [MIT License](LICENSE). It is **not** an official release of the upstream project.
 
-It started as a fix for a real, reproducible crash and grew into a leaner, D3D12-only build tailored for a Varjo Aero + NVIDIA setup, primarily used with IL-2 Sturmovik and DCS.
+It started as a fix for a real, reproducible crash and grew into a leaner, D3D12-only build tailored for a Varjo Aero + NVIDIA setup, primarily used with IL-2 Korea and DCS.
 
 **If you're looking for the original, actively-referenced project, go to [mbucchia/OpenXR-Toolkit](https://github.com/mbucchia/OpenXR-Toolkit).** This fork removes support some users may still need (see below) — read this page before installing.
 
