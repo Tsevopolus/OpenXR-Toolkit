@@ -1,24 +1,24 @@
 [submodule "external/OpenXR-SDK-Source"]
-	path = external/OpenXR-SDK-Source
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/OpenXR-SDK-Source
 	url = https://github.com/KhronosGroup/OpenXR-SDK-Source.git
 [submodule "external/OpenXR-MixedReality"]
-	path = external/OpenXR-MixedReality
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/OpenXR-MixedReality
 	url = https://github.com/microsoft/OpenXR-MixedReality.git
 [submodule "external/OpenXR-SDK"]
-	path = external/OpenXR-SDK
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/OpenXR-SDK
 	url = https://github.com/KhronosGroup/OpenXR-SDK.git
 [submodule "external/NVIDIAImageScaling"]
-	path = external/NVIDIAImageScaling
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/NVIDIAImageScaling
 	url = https://github.com/NVIDIAGameWorks/NVIDIAImageScaling/
 [submodule "external/FidelityFX-FSR"]
-	path = external/FidelityFX-FSR
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/FidelityFX-FSR
 	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git
 [submodule "external/NVAPI"]
-	path = external/NVAPI
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/NVAPI
 	url = https://github.com/mbucchia/NVAPI.git
 [submodule "external/Omnicept-SDK"]
-	path = external/Omnicept-SDK
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/Omnicept-SDK
 	url = https://github.com/mbucchia/Omnicept-SDK.git
 [submodule "external/FidelityFX-CAS"]
-	path = external/FidelityFX-CAS
+	path = XR_APILAYER_NEWKITONTHEBLOCK_toolkit/external/FidelityFX-CAS
 	url = https://github.com/GPUOpen-Effects/FidelityFX-CAS.git
