@@ -32,9 +32,6 @@ EndProject
 Project("{54435603-DBB4-11D2-8724-00A0C9A8B90C}") = "Setup", "installer\installer.vdproj", "{9D1EF86B-6B13-4C14-BBD7-E70CF7DD48DE}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "GitHub", "GitHub", "{3F9F661B-0558-4FF0-862C-4D1920CC2782}"
-	ProjectSection(SolutionItems) = preProject
-		.github\workflows\msbuild.yml = .github\workflows\msbuild.yml
-	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

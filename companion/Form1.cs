@@ -365,7 +365,7 @@ namespace companion
             {
                 Thread.CurrentThread.IsBackground = true;
 
-                string url = "https://api.github.com/repos/mbucchia/OpenXR-Toolkit/releases/latest";
+                string url = "https://api.github.com/repos/Tsevopolus/OpenXR-Toolkit/releases/latest";
 
                 // https://stackoverflow.com/questions/9620278/how-do-i-make-calls-to-a-rest-api-using-c
                 HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
@@ -503,7 +503,7 @@ namespace companion
 
         private void reportIssuesLink_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
-            string githubIssues = "https://github.com/mbucchia/OpenXR-Toolkit/issues?q=is%3Aissue+is%3Aopen+label%3Abug";
+            string githubIssues = "https://github.com/Tsevopolus/OpenXR-Toolkit/issues?q=is%3Aissue+is%3Aopen+label%3Abug";
 
             reportIssuesLink.LinkVisited = true;
             System.Diagnostics.Process.Start(githubIssues);
@@ -511,7 +511,7 @@ namespace companion
 
         private void checkUpdatesLink_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
-            string homepage = "https://mbucchia.github.io/OpenXR-Toolkit";
+            string homepage = "https://github.com/Tsevopolus/OpenXR-Toolkit";
 
             checkUpdatesLink.LinkVisited = true;
             System.Diagnostics.Process.Start(homepage);
@@ -733,7 +733,7 @@ namespace companion
 
         private void pictureBox1_Click(object sender, EventArgs e)
         {
-            string homepage = "https://mbucchia.github.io/OpenXR-Toolkit";
+            string homepage = "https://github.com/Tsevopolus/OpenXR-Toolkit";
 
             checkUpdatesLink.LinkVisited = true;
             System.Diagnostics.Process.Start(homepage);

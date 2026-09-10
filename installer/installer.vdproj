@@ -6826,7 +6826,7 @@
         "Name" = "8:Microsoft Visual Studio"
         "ProductName" = "8:OpenXR-Toolkit"
         "ProductCode" = "8:{FCAAACC4-9554-45C5-93C5-AB73A631C02C}"
-        "PackageCode" = "8:{F8EE7AF8-A5E6-47D8-BC9F-FB7C5204F9DB}"
+        "PackageCode" = "8:{17524AF5-8EA8-45F5-8691-FD0998B35DBE}"
         "UpgradeCode" = "8:{DE3B4392-8473-4208-A77F-812E54E09AE6}"
         "AspNetVersion" = "8:"
         "RestartWWWService" = "11:FALSE"
