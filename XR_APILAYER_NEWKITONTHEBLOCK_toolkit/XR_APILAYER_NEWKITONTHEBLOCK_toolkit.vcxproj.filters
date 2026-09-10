@@ -1,0 +1,202 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Framework">
+      <UniqueIdentifier>{060fbbc6-44b1-4494-b904-cb9719cec138}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shader Files">
+      <UniqueIdentifier>{c2ebac9a-c581-4829-a34f-51315d3c0ee9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\NIS">
+      <UniqueIdentifier>{3f84eb2b-0b37-4979-a72a-6c50cb5a63b0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\FSR">
+      <UniqueIdentifier>{2BFA8683-39CE-4F87-9CA4-AD6FC81A838E}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shader Files\NIS">
+      <UniqueIdentifier>{333f1c24-08c0-41f5-a1e9-9a3d8f26c3ae}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shader Files\PostProcess">
+      <UniqueIdentifier>{b3914fc2-ccc0-4628-8e7b-2ad1558c2762}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shader Files\FSR">
+      <UniqueIdentifier>{207574d0-b8f5-4ade-b7eb-66a5aa987e51}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Utils">
+      <UniqueIdentifier>{5d576e4a-db5d-4e19-ae3a-10ed2642dcda}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shader Files\VRS">
+      <UniqueIdentifier>{e1b58850-3359-4361-85e9-60b095c46aae}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Shader Files\CAS">
+      <UniqueIdentifier>{18b9944b-429a-4b5e-8df2-d9de6d96564f}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="log.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="layer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="framework\dispatch.gen.h">
+      <Filter>Framework</Filter>
+    </ClInclude>
+    <ClInclude Include="framework\dispatch.h">
+      <Filter>Framework</Filter>
+    </ClInclude>
+    <ClInclude Include="factories.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="interfaces.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="shader_utilities.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\external\NVIDIAImageScaling\NIS\NIS_Config.h">
+      <Filter>Header Files\NIS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\external\NVIDIAImageScaling\NIS\NIS_Scaler.h">
+      <Filter>Shader Files\NIS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\external\FidelityFX-FSR\ffx-fsr\ffx_a.h">
+      <Filter>Shader Files\FSR</Filter>
+    </ClInclude>
+    <ClInclude Include="..\external\FidelityFX-FSR\ffx-fsr\ffx_fsr1.h">
+      <Filter>Shader Files\FSR</Filter>
+    </ClInclude>
+    <ClInclude Include="d3dcommon.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="detours_helpers.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="utils\ScreenGrab12.h">
+      <Filter>Utils</Filter>
+    </ClInclude>
+    <ClInclude Include="..\external\FidelityFX-CAS\ffx-cas\ffx_a.h">
+      <Filter>Shader Files\CAS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\external\FidelityFX-CAS\ffx-cas\ffx_cas.h">
+      <Filter>Shader Files\CAS</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\Users\Tsev\Downloads\d3d12_textrenderer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="d3d12_textrenderer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="layer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="log.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="framework\dispatch.cpp">
+      <Filter>Framework</Filter>
+    </ClCompile>
+    <ClCompile Include="framework\dispatch.gen.cpp">
+      <Filter>Framework</Filter>
+    </ClCompile>
+    <ClCompile Include="framework\entry.cpp">
+      <Filter>Framework</Filter>
+    </ClCompile>
+    <ClCompile Include="menu.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="config.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="nis.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="imageprocess.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="utilities.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="fsr.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="hand2controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="vrs.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="frameanalyzer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="eyetracker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="utils\ScreenGrab12.cpp">
+      <Filter>Utils</Filter>
+    </ClCompile>
+    <ClCompile Include="cas.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="framework\dispatch_generator.py">
+      <Filter>Framework</Filter>
+    </None>
+    <None Include="framework\layer_apis.py">
+      <Filter>Framework</Filter>
+    </None>
+    <None Include="packages.config" />
+    <None Include="..\patches\FidelityFX-FSR\0000-conditionaly-compile-denoise-code-fsr-v1.20210629.patch">
+      <Filter>Header Files\FSR</Filter>
+    </None>
+    <None Include="..\patches\NVIDIAImageScaling\0000-allow-compileshader-option-wx-nis-1-0-2.patch">
+      <Filter>Header Files\NIS</Filter>
+    </None>
+    <None Include="XR_APILAYER_NEWKITONTHEBLOCK_toolkit.json">
+      <Filter>Source Files</Filter>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="postprocess.hlsl">
+      <Filter>Shader Files\PostProcess</Filter>
+    </FxCompile>
+    <FxCompile Include="NIS.hlsl">
+      <Filter>Shader Files\NIS</Filter>
+    </FxCompile>
+    <FxCompile Include="FSR.hlsl">
+      <Filter>Shader Files\FSR</Filter>
+    </FxCompile>
+    <FxCompile Include="VRS.hlsl">
+      <Filter>Shader Files\VRS</Filter>
+    </FxCompile>
+    <FxCompile Include="CAS.hlsl">
+      <Filter>Shader Files\CAS</Filter>
+    </FxCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="resource.rc" />
+  </ItemGroup>
+</Project>

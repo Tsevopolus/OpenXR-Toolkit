@@ -7,3 +7,5 @@ bin/
 *.pyc
 *.vcxproj.user
 *.csproj.user
+
+original-1.3.2/

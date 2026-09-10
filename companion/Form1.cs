@@ -220,16 +220,31 @@ namespace companion
             }
         }
 
+        // Set by the layer-enumeration loop in InitXr()/the periodic re-check, to whichever
+        // of the two layer names EnumerateApiLayerProperties() actually reported as loaded.
+        string activeLayerName = null;
+
         private void SetActiveString()
         {
-            if (versionString != null)
+            string friendlyName;
+            if (activeLayerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit")
             {
-                layerActive.Text = versionString + " is active";
+                friendlyName = "OpenXR Toolkit — NewKitOnTheBlock Fork";
+            }
+            else if (activeLayerName == "XR_APILAYER_MBUCCHIA_toolkit")
+            {
+                friendlyName = "OpenXR Toolkit 1.3.2 (original)";
+            }
+            else if (versionString != null)
+            {
+                friendlyName = versionString;
             }
             else
             {
-                layerActive.Text = "OpenXR Toolkit layer is active";
+                friendlyName = "OpenXR Toolkit layer";
             }
+
+            layerActive.Text = friendlyName + " is active";
 
             if (appString != "")
             {
@@ -249,7 +264,11 @@ namespace companion
             }
             catch (Exception)
             {
-                MessageBox.Show(this, "Failed to query version", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                // Not fatal: this only queries the original build's version string
+                // specifically (it's a fixed DllImport target), and SetActiveString()
+                // already falls back to the layer name itself when this is unavailable -
+                // which is what actually distinguishes fork vs. original in the UI.
+                versionString = null;
             }
 
             AppDomain dom = AppDomain.CreateDomain("temporaryXr");
@@ -275,6 +294,7 @@ namespace companion
                 if (xr.EnumerateApiLayerProperties(ref layerCount, layersSpan) == Result.Success)
                 {
                     bool found = false;
+                    activeLayerName = null;
                     string layersList = "";
                     for (int i = 0; i < layers.Length; i++)
                     {
@@ -282,9 +302,10 @@ namespace companion
                         {
                             string layerName = SilkMarshal.PtrToString(new System.IntPtr(nptr));
                             layersList += layerName + "\n";
-                            if (layerName == "XR_APILAYER_MBUCCHIA_toolkit")
+                            if (layerName == "XR_APILAYER_MBUCCHIA_toolkit" || layerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit")
                             {
                                 found = true;
+                                activeLayerName = layerName;
                             }
                         }
                     }
@@ -306,11 +327,15 @@ namespace companion
                         layerActive.ForeColor = Color.Green;
                         loading = true;
                         disableCheckbox.Checked = false;
+                        // Reflect which of the two layers is actually loaded, independent of
+                        // the disable/enable checkbox above (that one just toggles "any
+                        // toolkit layer at all" on or off).
+                        layerSelector.SelectedIndex = (activeLayerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit") ? 1 : 0;
                         loading = wasLoading;
                     }
                     safemodeCheckbox.Enabled = screenshotCheckbox.Enabled = screenshotFormat.Enabled = screenshotEye.Enabled =
                         menuVisibility.Enabled = leftKey.Enabled = nextKey.Enabled = previousKey.Enabled = rightKey.Enabled = screenshotKey.Enabled =
-                        ctrlModifierCheckbox.Enabled = altModifierCheckbox.Enabled = !disableCheckbox.Checked;
+                        ctrlModifierCheckbox.Enabled = altModifierCheckbox.Enabled = layerSelector.Enabled = !disableCheckbox.Checked;
                     screenshotFormat.Enabled = screenshotCheckbox.Enabled && screenshotCheckbox.Checked;
                 }
                 else
@@ -395,6 +420,87 @@ namespace companion
             }
         }
 
+        // Finds the actual registered value name (full manifest path, as the loader itself
+        // sees it) for one of our two layers, by scanning the existing registry entries -
+        // rather than guessing a path from where companion.exe happens to be running from
+        // right now. Falls back to a path built from our own location only if nothing is
+        // registered yet at all (e.g. a brand new install that hasn't run the MSI's own
+        // registration step for some reason).
+        private string FindRegisteredLayerPath(Microsoft.Win32.RegistryKey key, string jsonFileName)
+        {
+            if (key != null)
+            {
+                foreach (var valueName in key.GetValueNames())
+                {
+                    if (valueName.EndsWith("\\" + jsonFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return valueName;
+                    }
+                }
+            }
+
+            var assembly = Assembly.GetAssembly(GetType());
+            var installPath = Path.GetDirectoryName(assembly.Location);
+            return installPath + "\\" + jsonFileName;
+        }
+
+        private void layerSelector_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (loading)
+            {
+                return;
+            }
+
+            Microsoft.Win32.RegistryKey key = null;
+            try
+            {
+                key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey("SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit");
+
+                var newKitJsonPath = FindRegisteredLayerPath(key, "XR_APILAYER_NEWKITONTHEBLOCK_toolkit.json");
+                var originalJsonPath = FindRegisteredLayerPath(key, "XR_APILAYER_MBUCCHIA_toolkit.json");
+
+                // Registry convention here (matches the OpenXR loader spec and the existing
+                // disableCheckbox above): value 0 = enabled, non-zero = disabled. Exactly one
+                // of the two is enabled at a time - the dropdown makes that pairing explicit,
+                // unlike two independent checkboxes which could both end up checked at once.
+                if (layerSelector.SelectedIndex == 1)
+                {
+                    key.SetValue(newKitJsonPath, 0);
+                    key.SetValue(originalJsonPath, 1);
+                }
+                else
+                {
+                    key.SetValue(newKitJsonPath, 1);
+                    key.SetValue(originalJsonPath, 0);
+                }
+            }
+            catch (Exception)
+            {
+                MessageBox.Show(this, "Failed to write to registry. Please make sure the app is running elevated.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                if (key != null)
+                {
+                    key.Close();
+                }
+            }
+
+            // Re-run the same live check InitXr() does, so layerActive updates without
+            // needing a manual re-open of the app. A short delay first: reading the
+            // registry back immediately after writing to HKEY_LOCAL_MACHINE can still
+            // observe the pre-write value for a brief moment, so we give it a beat.
+            var refreshTimer = new System.Windows.Forms.Timer();
+            refreshTimer.Interval = 400;
+            refreshTimer.Tick += (s2, e2) =>
+            {
+                refreshTimer.Stop();
+                refreshTimer.Dispose();
+                InitXr();
+            };
+            refreshTimer.Start();
+        }
+
         private void reportIssuesLink_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
             string githubIssues = "https://github.com/mbucchia/OpenXR-Toolkit/issues?q=is%3Aissue+is%3Aopen+label%3Abug";
@@ -418,16 +524,18 @@ namespace companion
                 return;
             }
 
-            var assembly = Assembly.GetAssembly(GetType());
-            var installPath = Path.GetDirectoryName(assembly.Location);
-            var jsonName = "XR_APILAYER_MBUCCHIA_toolkit.json";
-            var jsonPath = installPath + "\\" + jsonName;
-
             Microsoft.Win32.RegistryKey key = null;
             Microsoft.Win32.RegistryKey wmrKey = null;
             try
             {
                 key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey("SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit");
+
+                // Disable whichever of the two layers is currently the selected one
+                // in the dropdown, not always just the original.
+                var targetJsonName = (layerSelector.SelectedIndex == 1)
+                    ? "XR_APILAYER_NEWKITONTHEBLOCK_toolkit.json"
+                    : "XR_APILAYER_MBUCCHIA_toolkit.json";
+                var jsonPath = FindRegisteredLayerPath(key, targetJsonName);
 
                 if (disableCheckbox.Checked)
                 {
@@ -596,7 +704,8 @@ namespace companion
             var processInfo = new ProcessStartInfo();
             processInfo.Verb = "Open";
             processInfo.UseShellExecute = true;
-            processInfo.FileName = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "\\OpenXR-Toolkit\\logs\\XR_APILAYER_MBUCCHIA_toolkit.log";
+            var logLayerName = activeLayerName ?? "XR_APILAYER_MBUCCHIA_toolkit";
+            processInfo.FileName = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + "\\OpenXR-Toolkit\\logs\\" + logLayerName + ".log";
             try
             {
                 Process.Start(processInfo);

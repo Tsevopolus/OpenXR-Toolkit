@@ -19,8 +19,15 @@ namespace SetupCustomActions
         protected override void OnAfterInstall(IDictionary savedState)
         {
             var installPath = Path.GetDirectoryName(base.Context.Parameters["AssemblyPath"]);
-            var jsonName = "XR_APILAYER_MBUCCHIA_toolkit.json";
+
+            // Two layers ship side by side now: our fork (NewKitOnTheBlock) and the
+            // original 1.3.2 build, kept for direct comparison. Both get registered;
+            // which one actually runs is controlled at runtime via each manifest's
+            // own "disable_environment" variable, toggled from the companion app.
+            var jsonName = "XR_APILAYER_NEWKITONTHEBLOCK_toolkit.json";
             var jsonPath = installPath + "\\" + jsonName;
+            var originalJsonName = "XR_APILAYER_MBUCCHIA_toolkit.json";
+            var originalJsonPath = installPath + "\\" + originalJsonName;
 
             // We want to add our layer at the very beginning, so that any other layer like the Ultraleap layer is following us.
             // We delete all entries, create our own, and recreate all entries.
@@ -55,7 +62,11 @@ namespace SetupCustomActions
             }
 
             bool detectedOldSoftware = false;
+            // Register both, but only the fork enabled by default (0 = enabled,
+            // 1 = disabled) - the two are not meant to run simultaneously. Switching
+            // to the original afterwards is done from the companion app's checkbox.
             key.SetValue(jsonPath, 0);
+            key.SetValue(originalJsonPath, 1);
             foreach (var value in existingValues)
             {
                 // Do not re-create keys for previous versions of our layer.
@@ -66,8 +77,9 @@ namespace SetupCustomActions
                     continue;
                 }
 
-                // Do not re-create our own key. We did it before this loop.
+                // Do not re-create our own keys. We did it before this loop.
                 if (value.EndsWith("\\" + jsonName) ||
+                    value.EndsWith("\\" + originalJsonName) ||
                     value.EndsWith("\\XR_APILAYER_NOVENDOR_toolkit.json"))
                 {
                     continue;
