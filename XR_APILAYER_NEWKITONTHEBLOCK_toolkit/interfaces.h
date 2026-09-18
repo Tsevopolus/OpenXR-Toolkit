@@ -2,6 +2,7 @@
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
 // Copyright(c) 2021-2022 Jean-Luc Dupiot - Reality XP
+// Copyright(c) 2026      Tsevopolus 
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -122,6 +123,7 @@ namespace toolkit {
         const std::string SettingMenuLegacyMode = "menu_legacy_mode";
         const std::string SettingOverlayType = "overlay";
         const std::string SettingOverlayShowClock = "overlay_show_clock";
+        const std::string SettingPerfCsvLog = "perf_csv_log";
         const std::string SettingOverlayXOffset = "overlay_x_offset";
         const std::string SettingOverlayYOffset = "overlay_y_offset";
         const std::string SettingMenuFontSize = "font_size2";

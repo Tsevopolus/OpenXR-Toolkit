@@ -1,6 +1,7 @@
 // MIT License
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
+// Copyright(c) 2026 Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -27,7 +28,7 @@
 namespace toolkit {
 
     const std::string LayerPrettyName = "OpenXR Toolkit — NewKitOnTheBlock Fork";
-    const std::string LayerPrettyNameFull = "OpenXR Toolkit — NewKitOnTheBlock Fork (v0.0.0)";
+    const std::string LayerPrettyNameFull = "OpenXR Toolkit — NewKitOnTheBlock Fork (v1.4.1)";
 
     const std::string LayerName = "XR_APILAYER_NEWKITONTHEBLOCK_toolkit";
     const std::string VersionString = "Unreleased";

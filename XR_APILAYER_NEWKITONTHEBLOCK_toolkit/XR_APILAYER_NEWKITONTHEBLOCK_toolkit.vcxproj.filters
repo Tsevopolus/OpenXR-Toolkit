@@ -95,10 +95,10 @@
     <ClInclude Include="..\external\FidelityFX-CAS\ffx-cas\ffx_cas.h">
       <Filter>Shader Files\CAS</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\..\Users\Tsev\Downloads\d3d12_textrenderer.h">
+    <ClInclude Include="d3d12_textrenderer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="d3d12_textrenderer.h">
+    <ClInclude Include="perf_csv_logger.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

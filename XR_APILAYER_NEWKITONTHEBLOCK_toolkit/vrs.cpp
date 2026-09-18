@@ -2,6 +2,7 @@
 //
 // Copyright(c) 2022 Matthieu Bucchianeri
 // Copyright(c) 2021-2022 Jean-Luc Dupiot - Reality XP
+// Copyright(c) 2026 Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -360,8 +361,8 @@ namespace {
             }
 
             if (auto context12 = context->getAs<D3D12>()) {
-                ComPtr<ID3D12GraphicsCommandList5> vrsCommandList;
-                if (FAILED(context12->QueryInterface(set(vrsCommandList)))) {
+                auto vrsCommandList = getCachedVrsCommandList(context12);
+                if (!vrsCommandList) {
                     DebugLog("VRS: failed to query ID3D12GraphicsCommandList5\n");
                     return false;
                 }
@@ -470,6 +471,23 @@ namespace {
         }
 
       private:
+        // QueryInterface() is cheap but not free, and onSetRenderTarget()/disable() can both
+        // run several times per frame (once per render target switch). The command list
+        // identity only ever changes when the underlying context is recreated (e.g. a
+        // swapchain/device reset), so caching by raw pointer avoids re-querying on every call
+        // while staying correct if that identity ever does change.
+        ID3D12GraphicsCommandList5* getCachedVrsCommandList(ID3D12GraphicsCommandList* context12) {
+            if (context12 != m_cachedCommandList) {
+                m_cachedVrsCommandList.Reset();
+                if (SUCCEEDED(context12->QueryInterface(set(m_cachedVrsCommandList)))) {
+                    m_cachedCommandList = context12;
+                } else {
+                    m_cachedCommandList = nullptr;
+                }
+            }
+            return get(m_cachedVrsCommandList);
+        }
+
         void createRenderResources(uint32_t renderWidth, uint32_t renderHeigh) {
             // Initialize compute shader
             {
@@ -504,8 +522,8 @@ namespace {
             if (m_device->getApi() == Api::D3D12) {
                 auto context12 = context ? context->getAs<D3D12>() : m_device->getContextAs<D3D12>();
 
-                ComPtr<ID3D12GraphicsCommandList5> vrsCommandList;
-                if (FAILED(context12->QueryInterface(set(vrsCommandList)))) {
+                auto vrsCommandList = getCachedVrsCommandList(context12);
+                if (!vrsCommandList) {
                     DebugLog("VRS: failed to query ID3D12GraphicsCommandList5\n");
                     return;
                 }
@@ -744,12 +762,21 @@ namespace {
             const auto dispatchY = xr::math::DivideRoundingUp(mask.heightInTiles, 8);
             for (size_t i = 0; i < std::size(mask.mask) + 1; i++) {
                 size_t target = std::min(i, std::size(mask.mask) - 1);
-                size_t eye = i;
+                // i=0,1 always render the left/right masks (eye 0/1) into mask.mask[0]/[1].
+                // i=2 and the extra i==3 pass both target the combined mask (target==2).
+                // - With eye tracking on: eye = i % 2, so i=2 writes it with the left eye's data
+                //   (m_Rates[0]/m_gazeLocation[0]) and i=3 then overwrites it with the right eye's
+                //   data (m_Rates[1]/m_gazeLocation[1]) - last write wins. That's the existing,
+                //   unchanged behavior; it does NOT use m_Rates[2]/m_gazeLocation[2] for this path.
+                // - With eye tracking off: eye is clamped to target (== 2) for both i=2 and i=3, so
+                //   both passes use the dedicated combined/no-bias entry m_Rates[2] (see
+                //   updateRates()) and m_gazeLocation[2]. Previously "eye" fell through to the raw
+                //   i (== 3) for the extra pass here, which is past the end of
+                //   m_Rates[ViewCount + 1]/m_gazeLocation[ViewCount + 1] (valid indices are only
+                //   0-2) - an out-of-bounds read. Clamping to target fixes that; the resulting
+                //   redundant re-render with identical data is harmless.
+                size_t eye = m_usingEyeTracking ? (i % 2) : target;
                 ShadingConstants constants;
-                if (m_usingEyeTracking) {
-                    // The combined mask has both eyes.
-                    eye = eye % 2;
-                }
                 constants = makeShadingConstants(eye, mask.widthInTiles, mask.heightInTiles);
                 mask.cbShading[i]->uploadData(&constants, sizeof(constants));
 
@@ -932,6 +959,10 @@ namespace {
         uint8_t m_shadingRates[SHADING_RATE_COUNT];
 
         std::shared_ptr<IComputeShader> m_csShading;
+
+        // Backing storage for getCachedVrsCommandList().
+        ID3D12GraphicsCommandList* m_cachedCommandList{nullptr};
+        ComPtr<ID3D12GraphicsCommandList5> m_cachedVrsCommandList;
         std::vector<ShadingRateMask> m_shadingRateMask;
         std::mutex m_shadingRateMaskLock;
 

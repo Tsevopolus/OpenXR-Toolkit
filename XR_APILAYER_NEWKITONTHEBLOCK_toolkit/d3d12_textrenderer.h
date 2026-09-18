@@ -1,3 +1,7 @@
+// MIT License
+//
+// Copyright(c) 2026 Tsevopolus
+// 
 // D3D12TextRenderer — a minimal, native D3D12 replacement for the FW1FontWrapper +
 // D3D11on12 interop text-rendering path.
 //
@@ -12,8 +16,10 @@
 //  - The atlas covers printable ASCII (32-126), which is all the toolkit's own menu
 //    strings use. Non-ASCII characters are rendered as a blank cell (see TODO below on
 //    where to extend this if you ever localize the menu).
-//  - Only ONE weight is baked into the atlas (no separate Bold atlas yet). TextStyle::Bold
-//    currently just reuses the Normal glyphs — see notes.
+//  - Both weights (Normal and Bold) are baked into one shared atlas texture, stacked
+//    vertically - Normal's rows on top, Bold's directly below, using the same column/cell
+//    grid (sized to fit whichever weight's glyphs are larger at a given cell) so a single
+//    SRV and root signature still cover both. See bakeFontAtlas().
 //  - Rendering is a simple batched textured-quad draw: drawString() appends quads to a
 //    CPU-side vector, flushText() uploads them into a per-frame dynamic (upload-heap)
 //    vertex buffer and issues one DrawInstanced call per flush.
@@ -90,11 +96,11 @@ namespace toolkit::graphics::d3d12text {
 
         // --- IDevice-shaped surface, to be called from D3D12Device's own overrides ---
 
-        float measureString(std::wstring_view string, float size) const {
+        float measureString(std::wstring_view string, bool bold, float size) const {
             const float scale = size / (float)BakePixelHeight;
             float width = 0.f;
             for (wchar_t ch : string) {
-                width += glyphFor(ch).advance * scale;
+                width += glyphFor(ch, bold).advance * scale;
             }
             return width;
         }
@@ -102,11 +108,14 @@ namespace toolkit::graphics::d3d12text {
         void beginText(ID3D12GraphicsCommandList* commandList,
                        D3D12_CPU_DESCRIPTOR_HANDLE renderTargetView,
                        DXGI_FORMAT renderTargetFormat,
+                       uint32_t renderTargetSampleCount,
                        int32_t viewportX,
                        int32_t viewportY,
                        uint32_t viewportWidth,
                        uint32_t viewportHeight) {
-            ensurePipeline(renderTargetFormat);
+            // renderTargetSampleCount == 0 would produce an invalid (zero-sample) PSO; treat
+            // it the same as the common "not multisampled" case.
+            ensurePipeline(renderTargetFormat, std::max(renderTargetSampleCount, 1u));
 
             m_commandList = commandList;
             m_renderTargetView = renderTargetView;
@@ -129,7 +138,7 @@ namespace toolkit::graphics::d3d12text {
                          bool measure,
                          int alignment) {
             const float scale = size / (float)BakePixelHeight;
-            const float totalWidth = measureString(string, size);
+            const float totalWidth = measureString(string, bold, size);
 
             float penX = x;
             if (alignment & TextAlignRight) {
@@ -144,15 +153,26 @@ namespace toolkit::graphics::d3d12text {
 
             float penY = y;
 
-            // TODO: `bold` currently maps to the same glyphs as normal - see class comment.
-            (void)bold;
-
             for (wchar_t ch : string) {
-                const GlyphInfo& g = glyphFor(ch);
-                const float gw = g.width * scale;
-                const float gh = g.height * scale;
+                const GlyphInfo& g = glyphFor(ch, bold);
 
-                appendQuad(penX, penY, gw, gh, g.u0, g.v0, g.u1, g.v1, color);
+                // g.width is the FULL baked cell width (tmMaxCharWidth + CellPadding*2 - see
+                // bakeFontAtlas()), which is generally wider than this glyph's own advance. Using
+                // the full cell as the quad width here would make adjacent glyphs' quads overlap
+                // by (cellWidth - advance) pixels; both cells' padding is transparent there, so
+                // it's normally invisible, but two overlapping semi-transparent quads still
+                // double-blend at the antialiased edges within that overlap, which can show as a
+                // faint darkening. Shrink the quad to just this glyph's own advance plus a
+                // CellPadding safety margin on each side (enough room for any antialiasing/
+                // overhang beyond the advance) instead of the shared, wider cell size, and remap
+                // the right UV edge to match - this keeps quads from adjacent glyphs from
+                // overlapping in the first place, without needing per-glyph ink bounding boxes.
+                const float inkWidth = std::min(g.width, g.advance + 2.f * CellPadding);
+                const float gw = inkWidth * scale;
+                const float gh = g.height * scale;
+                const float u1 = g.u0 + (inkWidth / g.width) * (g.u1 - g.u0);
+
+                appendQuad(penX, penY, gw, gh, g.u0, g.v0, u1, g.v1, color);
 
                 penX += g.advance * scale;
             }
@@ -166,15 +186,40 @@ namespace toolkit::graphics::d3d12text {
                 return;
             }
 
-            const size_t requiredBytes = m_pendingVertices.size() * sizeof(TextVertex);
-            CHECK_MSG(requiredBytes <= m_uploadBufferSize,
-                      "Text renderer: too many glyphs in one frame, grow m_uploadBufferSize");
+            size_t requiredBytes = m_pendingVertices.size() * sizeof(TextVertex);
+            if (requiredBytes > m_uploadSlotSize) {
+                // This used to CHECK_MSG/throw here. That exception has nothing catching it
+                // between here and xrEndFrame() - it would take down the whole process over a
+                // single oversized menu screen, rather than just losing this frame's text. Drop
+                // the overflow instead: clamp to whole quads (6 verts each) so we never submit a
+                // partial/garbled quad, log it so it's visible during development, and draw what
+                // fits.
+                const size_t maxVerts = (m_uploadSlotSize / sizeof(TextVertex)) / 6 * 6;
+                toolkit::log::Log(
+                    "Text renderer: too many glyphs in one frame (%zu of %zu budgeted bytes) - "
+                    "dropping the overflow instead of growing/crashing\n",
+                    requiredBytes,
+                    m_uploadSlotSize);
+                m_pendingVertices.resize(maxVerts);
+                requiredBytes = m_pendingVertices.size() * sizeof(TextVertex);
+            }
+
+            // Ping-pong between two halves of the upload buffer. m_vertexUploadBuffer is an
+            // upload-heap (CPU-writable) resource that DrawInstanced below reads from directly -
+            // with a single buffer, this Map/memcpy/Unmap would race the GPU still reading last
+            // flush's draw from the very same bytes, since nothing here waits for that draw to
+            // finish (VR overlays are exactly the case where the CPU commonly runs a frame or two
+            // ahead of the GPU). Alternating slots means each slot's previous contents are always
+            // at least one flush old by the time we overwrite it again.
+            m_currentUploadSlot = 1 - m_currentUploadSlot;
+            const size_t slotOffset = m_currentUploadSlot * m_uploadSlotSize;
 
             void* mapped = nullptr;
             const CD3DX12_RANGE noRead(0, 0);
             CHECK_HRCMD(m_vertexUploadBuffer->Map(0, &noRead, &mapped));
-            memcpy(mapped, m_pendingVertices.data(), requiredBytes);
-            m_vertexUploadBuffer->Unmap(0, nullptr);
+            memcpy(static_cast<uint8_t*>(mapped) + slotOffset, m_pendingVertices.data(), requiredBytes);
+            const CD3DX12_RANGE writtenRange(slotOffset, slotOffset + requiredBytes);
+            m_vertexUploadBuffer->Unmap(0, &writtenRange);
 
             m_commandList->SetGraphicsRootSignature(get(m_rootSignature));
             m_commandList->SetPipelineState(get(m_pipelineState));
@@ -203,11 +248,11 @@ namespace toolkit::graphics::d3d12text {
 
             const float invW = 2.f / (float)m_viewportWidth;
             const float invH = 2.f / (float)m_viewportHeight;
-            const float screenToClip[4] = {invW, invH, 0.f, 0.f}; // See vertex shader below.
-            m_commandList->SetGraphicsRoot32BitConstants(1, 4, screenToClip, 0);
+            const float screenToClip[2] = {invW, invH}; // See vertex shader below.
+            m_commandList->SetGraphicsRoot32BitConstants(1, 2, screenToClip, 0);
 
             D3D12_VERTEX_BUFFER_VIEW vbv{};
-            vbv.BufferLocation = m_vertexUploadBuffer->GetGPUVirtualAddress();
+            vbv.BufferLocation = m_vertexUploadBuffer->GetGPUVirtualAddress() + slotOffset;
             vbv.SizeInBytes = (UINT)requiredBytes;
             vbv.StrideInBytes = sizeof(TextVertex);
             m_commandList->IASetVertexBuffers(0, 1, &vbv);
@@ -220,11 +265,12 @@ namespace toolkit::graphics::d3d12text {
         }
 
       private:
-        const GlyphInfo& glyphFor(wchar_t ch) const {
+        const GlyphInfo& glyphFor(wchar_t ch, bool bold) const {
+            const GlyphInfo* glyphs = bold ? m_glyphsBold : m_glyphs;
             if (ch < FirstGlyph || ch > LastGlyph) {
-                return m_glyphs[0]; // Blank/space cell - see class comment on ASCII-only coverage.
+                return glyphs[0]; // Blank/space cell - see class comment on ASCII-only coverage.
             }
-            return m_glyphs[ch - FirstGlyph];
+            return glyphs[ch - FirstGlyph];
         }
 
         void appendQuad(
@@ -241,42 +287,78 @@ namespace toolkit::graphics::d3d12text {
             m_pendingVertices.insert(m_pendingVertices.end(), std::begin(v), std::end(v));
         }
 
-        // Rasterizes printable ASCII into a single grayscale atlas using GDI, then uploads
-        // it as an R8_UNORM D3D12 texture (sampled and tinted by `color` in the pixel shader).
+        // Rasterizes printable ASCII, in both weights, into a single grayscale atlas using
+        // GDI, then uploads it as an R8_UNORM D3D12 texture (sampled and tinted by `color` in
+        // the pixel shader). Normal's glyphs occupy the top AtlasRows rows, Bold's occupy an
+        // identical block of AtlasRows rows directly below - see the class comment.
         void bakeFontAtlas() {
             HDC screenDC = GetDC(nullptr);
             HDC memDC = CreateCompatibleDC(screenDC);
 
-            HFONT font = CreateFontW(-BakePixelHeight,
-                                     0,
-                                     0,
-                                     0,
-                                     FW_NORMAL,
-                                     FALSE,
-                                     FALSE,
-                                     FALSE,
-                                     DEFAULT_CHARSET,
-                                     OUT_TT_PRECIS,
-                                     CLIP_DEFAULT_PRECIS,
-                                     ANTIALIASED_QUALITY,
-                                     DEFAULT_PITCH | FF_DONTCARE,
-                                     L"Segoe UI");
-            HGDIOBJ oldFontForMetrics = SelectObject(memDC, font);
+            struct Weight {
+                HFONT font;
+                TEXTMETRICW tm{};
+                GlyphInfo* glyphs;
+            };
+            Weight weights[2] = {
+                {CreateFontW(-BakePixelHeight,
+                             0,
+                             0,
+                             0,
+                             FW_NORMAL,
+                             FALSE,
+                             FALSE,
+                             FALSE,
+                             DEFAULT_CHARSET,
+                             OUT_TT_PRECIS,
+                             CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE,
+                             L"Segoe UI"),
+                 {},
+                 m_glyphs},
+                {CreateFontW(-BakePixelHeight,
+                             0,
+                             0,
+                             0,
+                             FW_BOLD,
+                             FALSE,
+                             FALSE,
+                             FALSE,
+                             DEFAULT_CHARSET,
+                             OUT_TT_PRECIS,
+                             CLIP_DEFAULT_PRECIS,
+                             ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE,
+                             L"Segoe UI"),
+                 {},
+                 m_glyphsBold},
+            };
 
-            // Size cells from the FONT'S OWN real metrics rather than guessing. This matters
+            // Put a valid font in the DC before anything else touches it, and remember it so we
+            // can restore it below before deleting our own font objects (GDI convention: never
+            // delete a font object while it's still selected into a DC).
+            HGDIOBJ oldFontForMetrics = SelectObject(memDC, weights[0].font);
+
+            // Size cells from the FONTS' OWN real metrics rather than guessing. This matters
             // because CreateFontW's height only controls the em-square - actual glyph ink
             // (especially descenders on g/y/p/q/j) commonly extends well beyond that, and if
             // the cell is too small, one row's descenders bleed into the row below it in the
             // atlas (visible as stray marks above unrelated glyphs). tmHeight already covers
-            // ascent+descent; we add generous extra padding on top as a further safety
-            // margin, since ANTIALIASED_QUALITY can still spill a pixel or two past the
-            // reported metrics.
-            TEXTMETRICW tm{};
-            GetTextMetricsW(memDC, &tm);
-            const int cellW = tm.tmMaxCharWidth + CellPadding * 2;
-            const int cellH = tm.tmHeight + CellPadding * 2;
+            // ascent+descent; we add generous extra padding on top as a further safety margin,
+            // since ANTIALIASED_QUALITY can still spill a pixel or two past the reported
+            // metrics. The cell grid is shared between both weights (so a single SRV/atlas
+            // layout works for both), sized to whichever weight needs more room - Bold is
+            // usually a little wider than Normal at the same point size.
+            for (auto& w : weights) {
+                SelectObject(memDC, w.font);
+                GetTextMetricsW(memDC, &w.tm);
+            }
+            const int cellW = std::max(weights[0].tm.tmMaxCharWidth, weights[1].tm.tmMaxCharWidth) + CellPadding * 2;
+            const int cellH = std::max(weights[0].tm.tmHeight, weights[1].tm.tmHeight) + CellPadding * 2;
             const int atlasW = cellW * AtlasColumns;
-            const int atlasH = cellH * AtlasRows;
+            const int atlasHPerWeight = cellH * AtlasRows;
+            const int atlasH = atlasHPerWeight * 2; // Normal's block, then Bold's block.
 
             BITMAPINFO bmi{};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -293,52 +375,64 @@ namespace toolkit::graphics::d3d12text {
             // Clear to black (we only use the atlas as an alpha/coverage mask).
             memset(bits, 0, (size_t)atlasW * atlasH * 4);
 
-            // Re-select the font now that it's drawing into the real DIB section (some GDI
-            // implementations reset font smoothing state when the target surface changes).
-            SelectObject(memDC, font);
             SetBkMode(memDC, TRANSPARENT);
             SetTextColor(memDC, RGB(255, 255, 255));
 
-            for (int i = 0; i < GlyphCount; i++) {
-                const wchar_t ch = FirstGlyph + i;
-                const int col = i % AtlasColumns;
-                const int row = i / AtlasColumns;
-                // Anchor each glyph at its own baseline (tmAscent below the cell's top padding)
-                // rather than the cell's raw top, so ascenders/descenders land consistently
-                // within the padding on both sides instead of only being safe on one side.
-                const int cellX = col * cellW + CellPadding;
-                const int cellTop = row * cellH + CellPadding;
+            for (int weightIndex = 0; weightIndex < 2; weightIndex++) {
+                auto& w = weights[weightIndex];
+                const int rowOffset = weightIndex * AtlasRows;
 
-                SIZE extent{};
-                const wchar_t str[2] = {ch, 0};
-                GetTextExtentPoint32W(memDC, str, 1, &extent);
-                ExtTextOutW(memDC, cellX, cellTop, ETO_CLIPPED, nullptr, str, 1, nullptr);
+                // Re-select the font for this weight now that it's drawing into the real DIB
+                // section (some GDI implementations reset font smoothing state when the target
+                // surface changes).
+                SelectObject(memDC, w.font);
 
-                INT advanceWidth = extent.cx;
-                GetCharWidth32W(memDC, ch, ch, &advanceWidth);
+                for (int i = 0; i < GlyphCount; i++) {
+                    const wchar_t ch = FirstGlyph + i;
+                    const int col = i % AtlasColumns;
+                    const int row = i / AtlasColumns + rowOffset;
+                    // Anchor each glyph at its own baseline (tmAscent below the cell's top
+                    // padding) rather than the cell's raw top, so ascenders/descenders land
+                    // consistently within the padding on both sides instead of only being safe
+                    // on one side.
+                    const int cellX = col * cellW + CellPadding;
+                    const int cellTop = row * cellH + CellPadding;
 
-                GlyphInfo& g = m_glyphs[i];
-                g.advance = (float)advanceWidth;
-                g.u0 = (float)(col * cellW) / atlasW;
-                g.v0 = (float)(row * cellH) / atlasH;
-                g.u1 = (float)(col * cellW + cellW) / atlasW;
-                g.v1 = (float)(row * cellH + cellH) / atlasH;
-                // Use the full cell as the quad size so glyphs aren't clipped; advance stays
-                // based on the font's real metrics so spacing looks correct.
-                g.width = (float)cellW;
-                g.height = (float)cellH;
+                    SIZE extent{};
+                    const wchar_t str[2] = {ch, 0};
+                    GetTextExtentPoint32W(memDC, str, 1, &extent);
+                    ExtTextOutW(memDC, cellX, cellTop, ETO_CLIPPED, nullptr, str, 1, nullptr);
+
+                    INT advanceWidth = extent.cx;
+                    GetCharWidth32W(memDC, ch, ch, &advanceWidth);
+
+                    GlyphInfo& g = w.glyphs[i];
+                    g.advance = (float)advanceWidth;
+                    g.u0 = (float)(col * cellW) / atlasW;
+                    g.v0 = (float)(row * cellH) / atlasH;
+                    g.u1 = (float)(col * cellW + cellW) / atlasW;
+                    g.v1 = (float)(row * cellH + cellH) / atlasH;
+                    // Use the full cell as the quad size so glyphs aren't clipped; advance stays
+                    // based on the font's real metrics so spacing looks correct. (drawString()
+                    // shrinks the actually-drawn quad back down closer to the advance - see
+                    // there for why the cell itself still needs to be this wide.)
+                    g.width = (float)cellW;
+                    g.height = (float)cellH;
+                }
             }
 
             // Extract the blue channel (any channel works - GDI wrote greyscale into RGB)
             // as our R8 coverage atlas.
-            std::vector<uint8_t> atlasR8(atlasW * atlasH);
+            std::vector<uint8_t> atlasR8((size_t)atlasW * atlasH);
             const uint8_t* src = reinterpret_cast<const uint8_t*>(bits);
-            for (int p = 0; p < atlasW * atlasH; p++) {
+            for (size_t p = 0; p < atlasR8.size(); p++) {
                 atlasR8[p] = src[p * 4 + 0]; // BGRA -> B
             }
 
             SelectObject(memDC, oldFontForMetrics);
-            DeleteObject(font);
+            for (auto& w : weights) {
+                DeleteObject(w.font);
+            }
             SelectObject(memDC, oldBitmap);
             DeleteObject(dib);
             DeleteDC(memDC);
@@ -404,11 +498,13 @@ namespace toolkit::graphics::d3d12text {
         }
 
         void createRootSignature() {
-            // Root signature: t0 (atlas SRV, table) + 4 root constants (screen-to-clip scale).
+            // Root signature: t0 (atlas SRV, table) + 2 root constants (screen-to-clip scale,
+            // matching the HLSL cbuffer's float2 screenToClip below - was 4 for no reason, which
+            // left 2 unused/uninitialized DWORDs in the root constant block).
             CD3DX12_DESCRIPTOR_RANGE srvRange(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
             CD3DX12_ROOT_PARAMETER params[2];
             params[0].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL);
-            params[1].InitAsConstants(4, 0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
+            params[1].InitAsConstants(2, 0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
 
             D3D12_STATIC_SAMPLER_DESC sampler{};
             sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -434,15 +530,27 @@ namespace toolkit::graphics::d3d12text {
                 0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(set(m_rootSignature))));
         }
 
-        // Builds (or rebuilds, if the format changed) the PSO. Called lazily from beginText()
-        // because the render target format isn't known until then. In practice this runs
-        // once - the menu texture format doesn't change mid-session - so the cost of the
-        // format check on every beginText() call is negligible.
-        void ensurePipeline(DXGI_FORMAT rtvFormat) {
-            if (m_pipelineState && m_rtvFormat == rtvFormat) {
+        // Builds (or rebuilds, if the format or sample count changed) the PSO. Called lazily
+        // from beginText() because the render target format isn't known until then.
+        //
+        // The sample count matters just as much as the format: this class draws onto whatever
+        // texture the caller most recently bound via setRenderTargets(), and that isn't always
+        // the toolkit's own dedicated (always single-sampled) menu quad swapchain - the legacy
+        // menu mode draws directly onto the application's own swapchain image, which can be
+        // multisampled if the application (or the user, via its in-game MSAA setting) requested
+        // it. A PSO built with SampleDesc.Count=1 against a multisampled render target is a
+        // mismatch: ID3D12GraphicsCommandList::DrawInstanced with that PSO bound produces no
+        // visible pixels (this was silently swallowed here, so it only showed up as "the menu
+        // background/highlight boxes render via ClearRenderTargetView - which does not care
+        // about sample count - but no glyph ever appears" with legacy menu mode enabled).
+        // In practice this runs once per distinct (format, sampleCount) pair actually used -
+        // the cost of the check on every beginText() call is negligible.
+        void ensurePipeline(DXGI_FORMAT rtvFormat, uint32_t sampleCount) {
+            if (m_pipelineState && m_rtvFormat == rtvFormat && m_sampleCount == sampleCount) {
                 return;
             }
             m_rtvFormat = rtvFormat;
+            m_sampleCount = sampleCount;
 
             // clang-format off
             static constexpr char ShaderSource[] = R"(
@@ -531,7 +639,7 @@ namespace toolkit::graphics::d3d12text {
             psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
             psoDesc.NumRenderTargets = 1;
             psoDesc.RTVFormats[0] = m_rtvFormat;
-            psoDesc.SampleDesc.Count = 1;
+            psoDesc.SampleDesc.Count = m_sampleCount;
             psoDesc.SampleMask = UINT_MAX;
 
             psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
@@ -572,10 +680,15 @@ namespace toolkit::graphics::d3d12text {
 
             // Dynamic (upload-heap) vertex buffer, sized generously for one frame's worth of
             // glyph quads. 8192 chars * 6 verts * sizeof(TextVertex) covers the vast majority
-            // of the toolkit's menu screens - grow this if you hit the assert in flushText().
-            m_uploadBufferSize = 8192 * 6 * sizeof(TextVertex);
+            // of the toolkit's menu screens (see flushText() for what happens if a screen ever
+            // exceeds this).
+            //
+            // The buffer holds TWO such slots, ping-ponged per flushText() call (see there) so
+            // that writing this frame's vertices never overlaps the GPU still reading last
+            // flush's draw out of the same memory.
+            m_uploadSlotSize = 8192 * 6 * sizeof(TextVertex);
             const D3D12_HEAP_PROPERTIES uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-            const D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(m_uploadBufferSize);
+            const D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(m_uploadSlotSize * 2);
             CHECK_HRCMD(m_device->CreateCommittedResource(&uploadHeap,
                                                           D3D12_HEAP_FLAG_NONE,
                                                           &bufferDesc,
@@ -588,8 +701,10 @@ namespace toolkit::graphics::d3d12text {
         ID3D12Device* m_device{nullptr};
         ID3D12CommandQueue* m_uploadQueue{nullptr};
         DXGI_FORMAT m_rtvFormat{DXGI_FORMAT_UNKNOWN};
+        uint32_t m_sampleCount{1};
 
         GlyphInfo m_glyphs[GlyphCount]{};
+        GlyphInfo m_glyphsBold[GlyphCount]{};
         ComPtr<ID3D12Resource> m_atlasTexture;
         ComPtr<ID3D12DescriptorHeap> m_srvHeap;
 
@@ -597,7 +712,8 @@ namespace toolkit::graphics::d3d12text {
         ComPtr<ID3D12PipelineState> m_pipelineState;
 
         ComPtr<ID3D12Resource> m_vertexUploadBuffer;
-        size_t m_uploadBufferSize{0};
+        size_t m_uploadSlotSize{0}; // Capacity of ONE of the two ping-ponged slots (see flushText()).
+        uint32_t m_currentUploadSlot{0};
         std::vector<TextVertex> m_pendingVertices;
 
         // Set per-beginText() call; cleared by flushText().

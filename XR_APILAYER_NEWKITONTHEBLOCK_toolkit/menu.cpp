@@ -2,6 +2,7 @@
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
 // Copyright(c) 2021-2022 Jean-Luc Dupiot - Reality XP
+// Copyright(c) 2026      Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -27,6 +28,7 @@
 #include "factories.h"
 #include "interfaces.h"
 #include "log.h"
+#include "perf_csv_logger.h"
 
 namespace {
 
@@ -110,7 +112,6 @@ namespace {
         static std::string FmtEnum(int value);
         template <size_t N, int offset = 0>
         static std::string FmtDecimal(int value);
-        static std::string FmtPostVal(int value);
         static std::string FmtPercent(int value);
         static std::string FmtVrsRate(int value);
         static std::string FmtNone(int);
@@ -250,16 +251,24 @@ namespace {
                     m_resetTextLayout = m_resetBackgroundLayout = true;
 
                 } else if (m_state == MenuState::Visible) {
-                    do {
-                        static_assert(std::is_unsigned_v<decltype(m_selectedItem)>);
+                    static_assert(std::is_unsigned_v<decltype(m_selectedItem)>);
 
+                    // Bounded by m_menuEntries.size(): if every entry were somehow a separator,
+                    // disabled, or invisible at once (not currently reachable - the tab bar entry
+                    // is always visible/enabled - but cheap to guard against a future menu screen
+                    // that manages to filter everything out), this would otherwise spin forever
+                    // instead of just leaving m_selectedItem on whatever it last visited.
+                    for (size_t attempts = 0; attempts < m_menuEntries.size(); attempts++) {
                         m_selectedItem += moveUp ? -1 : 1;
                         if (m_selectedItem >= m_menuEntries.size()) {
                             m_selectedItem = moveUp ? m_menuEntries.size() - 1 : 0;
                         }
 
-                    } while (m_menuEntries[m_selectedItem].type == MenuEntryType::Separator ||
-                             m_menuEntries[m_selectedItem].disable || !m_menuEntries[m_selectedItem].visible);
+                        if (m_menuEntries[m_selectedItem].type != MenuEntryType::Separator &&
+                            !m_menuEntries[m_selectedItem].disable && m_menuEntries[m_selectedItem].visible) {
+                            break;
+                        }
+                    }
                 }
 
                 m_resetArmed = false;
@@ -321,11 +330,14 @@ namespace {
                     // When changing some settings, display the warning that the session must be restarted.
                     const bool wasRestartNeeded = std::exchange(m_needRestart, checkNeedRestartCondition());
 
-                    // When switching tab, changing the font size, switching expert menu or displaying the restart
-                    // banner, force re-alignment/re-size.
+                    // When switching tab, changing the font size, switching expert menu,
+                    // toggling legacy menu mode (its background opacity/alpha handling and menu
+                    // group visibility differ - see render()), or displaying the restart banner,
+                    // force re-alignment/re-size.
                     if (wasRestartNeeded != m_needRestart ||
                         ((menuEntry.type == MenuEntryType::Tabs || menuEntry.configName == SettingMenuFontSize ||
-                          menuEntry.configName == SettingMenuExpert || menuEntry.configName == SettingPostProcess) &&
+                          menuEntry.configName == SettingMenuExpert || menuEntry.configName == SettingPostProcess ||
+                          menuEntry.configName == SettingMenuLegacyMode) &&
                          previousValue != peekEntryValue(menuEntry))) {
                         m_resetTextLayout = m_resetBackgroundLayout = true;
                     }
@@ -1091,6 +1103,19 @@ namespace {
 
         void updateStatistics(const MenuStatistics& stats) override {
             m_stats = stats;
+
+            // CSV logging: start/stop follows the menu setting, then log this update.
+            const bool wantCsvLog = m_configManager->getValue(SettingPerfCsvLog) != 0;
+            if (wantCsvLog && !m_perfCsvLogger.isLogging()) {
+                const auto path = m_perfCsvLogger.start(LayerName);
+                if (!path.empty()) {
+                    Log("Performance CSV logging started: %s\n", path.c_str());
+                }
+            } else if (!wantCsvLog && m_perfCsvLogger.isLogging()) {
+                Log("Performance CSV logging stopped\n");
+                m_perfCsvLogger.stop();
+            }
+            m_perfCsvLogger.log(m_stats);
         }
 
         void updateGesturesState(const GesturesState& state) override {
@@ -1927,6 +1952,14 @@ namespace {
                                      MenuEntry::LastVal<NoYesType>(),
                                      MenuEntry::FmtEnum<NoYesType>});
             m_menuEntries.push_back({MenuIndent::OptionIndent,
+                                     "Log performance to CSV",
+                                     MenuEntryType::Choice,
+                                     SettingPerfCsvLog,
+                                     0,
+                                     MenuEntry::LastVal<NoYesType>(),
+                                     MenuEntry::FmtEnum<NoYesType>});
+            m_menuEntries.back().expert = true;
+            m_menuEntries.push_back({MenuIndent::OptionIndent,
                                      "Overlay horizontal offset",
                                      MenuEntryType::Slider,
                                      SettingOverlayXOffset,
@@ -2145,6 +2178,7 @@ namespace {
         std::wstring m_turboWarning;
         std::wstring m_predictionDampeningWarning;
         MenuStatistics m_stats{};
+        mutable utilities::PerformanceCsvLogger m_perfCsvLogger;
         GesturesState m_gesturesState{};
         EyeGazeState m_eyeGazeState{};
 
@@ -2215,16 +2249,6 @@ namespace {
         value += offset;
         auto prec = value % pow10;
         return fmt::format("{:.{}f}", static_cast<float>(value) / pow10, prec ? N : 0);
-    }
-
-    std::string MenuEntry::FmtPostVal(int value) {
-        if (value == 0)
-            return "min";
-        if (value == 1000)
-            return "max";
-        if (value == 500)
-            return "neutral";
-        return FmtDecimal<1>(value);
     }
 
     std::string MenuEntry::FmtVrsRate(int value) {

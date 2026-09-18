@@ -2,6 +2,7 @@
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
 // Copyright(c) 2021-2022 Jean-Luc Dupiot - Reality XP
+// Copyright(c) 2026      Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -1048,6 +1049,17 @@ namespace {
             if (XR_SUCCEEDED(result)) {
                 uint32_t imageCount;
                 CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(*swapchain, 0, &imageCount, nullptr));
+                if (!imageCount) {
+                    // Guards the d3dImages[0] access below (and the std::vector(imageCount, ...)
+                    // construction) - a runtime returning 0 images here would otherwise be UB.
+                    // *swapchain is already a real OpenXR handle at this point (xrCreateSwapchain()
+                    // above succeeded) - destroy it before throwing, or it leaks on the runtime
+                    // side and the caller is left holding a handle nobody will ever use or free.
+                    Log("The OpenXR runtime returned 0 swapchain images\n");
+                    OpenXrApi::xrDestroySwapchain(*swapchain);
+                    *swapchain = XR_NULL_HANDLE;
+                    throw std::runtime_error("Runtime returned 0 swapchain images");
+                }
 
                 SwapchainState swapchainState;
                 int64_t overrideFormat = 0;
@@ -3250,6 +3262,13 @@ namespace {
             CHECK_XRCMD(xrEnumerateSwapchainFormats(m_vrSession, 0, &formatCount, nullptr));
             std::vector<int64_t> formats(formatCount);
             CHECK_XRCMD(xrEnumerateSwapchainFormats(m_vrSession, formatCount, &formatCount, formats.data()));
+            if (!formatCount) {
+                // Same reasoning as the imageCount==0 guard below: indexing formats[0] into an
+                // empty vector would otherwise be silent out-of-bounds access rather than a loud
+                // failure.
+                Log("The OpenXR runtime returned 0 supported swapchain formats\n");
+                throw std::runtime_error("Runtime returned 0 supported swapchain formats");
+            }
 
             XrSwapchainCreateInfo swapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
             swapchainInfo.width = swapchainInfo.height = 2048; // Let's hope the menu doesn't get bigger than that.
@@ -3264,6 +3283,17 @@ namespace {
 
             uint32_t imageCount;
             CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(m_menuSwapchain, 0, &imageCount, nullptr));
+            if (!imageCount) {
+                // Same reasoning as in xrCreateSwapchain() above: a 0-image swapchain would
+                // otherwise leave m_menuSwapchainImages silently empty instead of failing loudly.
+                // m_menuSwapchain is a member (already set from the xrCreateSwapchain() call just
+                // above) - destroy it and reset the member before throwing, or the object is left
+                // holding a dangling/leaked handle that nothing will ever clean up.
+                Log("The OpenXR runtime returned 0 menu swapchain images\n");
+                OpenXrApi::xrDestroySwapchain(m_menuSwapchain);
+                m_menuSwapchain = XR_NULL_HANDLE;
+                throw std::runtime_error("Runtime returned 0 menu swapchain images");
+            }
 
             SwapchainState swapchainState;
             int64_t overrideFormat = 0;
@@ -3320,8 +3350,11 @@ namespace {
         uint32_t m_visibilityMaskEventIndex{utilities::ViewCount};
         XrSpace m_viewSpace{XR_NULL_HANDLE};
         bool m_needCalibrateEyeProjections{true};
-        XrVector2f m_projCenters[utilities::ViewCount];
-        XrVector2f m_eyeGaze[utilities::ViewCount];
+        // Only actually populated once xrLocateViews() successfully calibrates (requires a valid
+        // pose from the runtime); left uninitialized, these were indeterminate POD values that
+        // could reach setViewProjectionCenters()/the menu/VRS before calibration ever succeeds.
+        XrVector2f m_projCenters[utilities::ViewCount]{};
+        XrVector2f m_eyeGaze[utilities::ViewCount]{};
         XrView m_posesForFrame[utilities::ViewCount];
         std::chrono::time_point<std::chrono::steady_clock> m_lastFrameWaitTimestamp{};
         uint32_t m_frameThrottleSleepOffset{0};

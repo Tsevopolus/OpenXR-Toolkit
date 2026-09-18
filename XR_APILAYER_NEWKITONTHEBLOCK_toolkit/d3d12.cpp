@@ -2,6 +2,7 @@
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
 // Copyright(c) 2021-2022 Jean-Luc Dupiot - Reality XP
+// Copyright(c) 2026      Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -118,11 +119,37 @@ namespace {
         }
 
         void allocate(D3D12_CPU_DESCRIPTOR_HANDLE& desc) {
-            assert((UINT)heapOffset < heapSize);
+            // Prefer reusing a slot freed by a destroyed view over growing into fresh space -
+            // this is what actually keeps the heap bounded across repeated swapchain
+            // recreation (e.g. every mission reload) instead of monotonically filling up.
+            if (!m_freeList.empty()) {
+                INT offset = m_freeList.back();
+                m_freeList.pop_back();
+                desc = CD3DX12_CPU_DESCRIPTOR_HANDLE(heapStartCPU, offset, descSize);
+                return;
+            }
+
+            // This used to be assert()-only, which is compiled out under NDEBUG (i.e. exactly
+            // the Release config this project ships) - meaning an exhausted heap would silently
+            // hand out an out-of-bounds descriptor instead of failing loudly. Throwing here
+            // survives Release builds and turns that into a clean, catchable failure.
+            if ((UINT)heapOffset >= heapSize) {
+                throw std::runtime_error("D3D12Heap exhausted: no descriptor slots left to allocate");
+            }
             desc = CD3DX12_CPU_DESCRIPTOR_HANDLE(heapStartCPU, heapOffset++, descSize);
         }
 
-        // TODO: Implement freeing a descriptor
+        void free(D3D12_CPU_DESCRIPTOR_HANDLE desc) {
+            // A descriptor from a different heap (RTV/DSV/CBV_SRV_UAV heaps are all passed
+            // around by reference with no type tag) would otherwise compute a garbage offset
+            // here, get pushed onto m_freeList, and later be handed back out by allocate() as
+            // an out-of-range or colliding slot. Catch that instead of corrupting the free list.
+            const INT offset = (INT)((desc.ptr - heapStartCPU.ptr) / descSize);
+            if (offset < 0 || (UINT)offset >= heapSize) {
+                throw std::runtime_error("D3D12Heap::free: descriptor does not belong to this heap");
+            }
+            m_freeList.push_back(offset);
+        }
 
         D3D12_GPU_DESCRIPTOR_HANDLE getGPUHandle(D3D12_CPU_DESCRIPTOR_HANDLE cpuHandle) const {
             INT64 offset = (cpuHandle.ptr - heapStartCPU.ptr) / descSize;
@@ -131,10 +158,13 @@ namespace {
 
         UINT heapSize{0};
         ComPtr<ID3D12DescriptorHeap> heap;
-        D3D12_CPU_DESCRIPTOR_HANDLE heapStartCPU;
-        D3D12_GPU_DESCRIPTOR_HANDLE heapStartGPU;
+        // Zero-initialized so a default-constructed D3D12Heap (before initialize() runs) can't
+        // hit a division by descSize == 0 in free()'s offset computation.
+        D3D12_CPU_DESCRIPTOR_HANDLE heapStartCPU{};
+        D3D12_GPU_DESCRIPTOR_HANDLE heapStartGPU{};
         INT heapOffset{0};
-        UINT descSize;
+        UINT descSize{0};
+        std::vector<INT> m_freeList;
     };
 
     // Wrap shader resources, common code for root signature creation.
@@ -372,8 +402,18 @@ namespace {
                               public IRenderTargetView,
                               public IDepthStencilView {
       public:
-        D3D12ResourceView(std::shared_ptr<IDevice> device, D3D12_CPU_DESCRIPTOR_HANDLE resourceView)
-            : m_device(device), m_resourceView(resourceView) {
+        // owningHeap may be null (e.g. for views that are not backed by one of the freeable
+        // per-device heaps); in that case the destructor simply skips freeing, same as before.
+        D3D12ResourceView(std::shared_ptr<IDevice> device,
+                          D3D12_CPU_DESCRIPTOR_HANDLE resourceView,
+                          D3D12Heap* owningHeap = nullptr)
+            : m_device(device), m_resourceView(resourceView), m_owningHeap(owningHeap) {
+        }
+
+        virtual ~D3D12ResourceView() {
+            if (m_owningHeap) {
+                m_owningHeap->free(m_resourceView);
+            }
         }
 
         Api getApi() const override {
@@ -391,6 +431,7 @@ namespace {
       private:
         const std::shared_ptr<IDevice> m_device;
         const D3D12_CPU_DESCRIPTOR_HANDLE m_resourceView;
+        D3D12Heap* const m_owningHeap;
     };
 
     // Wrap a texture resource. Obtained from D3D12Device.
@@ -478,8 +519,15 @@ namespace {
 
             // Create an upload buffer if we don't have one already
             if (!m_uploadBuffer) {
-                m_uploadSize = alignTo((UINT)m_textureDesc.Width, m_device->getTextureAlignmentConstraint()) *
-                               m_textureDesc.Height;
+                // rowPitch is already a byte pitch (see the alignment assert above), so the
+                // correct buffer size is rowPitch * Height - the same value this function later
+                // hands the GPU via footprint.Footprint.RowPitch below. The previous computation
+                // (alignTo(Width, align) * Height) was a *pixel* count that happened to match
+                // rowPitch * Height only for 1-byte-per-pixel formats; for anything wider it
+                // under-allocated this buffer and under-copied the caller's data into it below,
+                // while the GPU copy still read rowPitch * Height bytes from it - reading past the
+                // end of the allocation.
+                m_uploadSize = rowPitch * m_textureDesc.Height;
                 const auto& heapType = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
                 const auto stagingDesc = CD3DX12_RESOURCE_DESC::Buffer(m_uploadSize);
                 CHECK_HRCMD(m_device->getAs<D3D12>()->CreateCommittedResource(&heapType,
@@ -577,7 +625,22 @@ namespace {
             HRESULT hr;
             ComPtr<ID3D12CommandQueue> commandQueue;
             UINT size = sizeof(ID3D12CommandQueue*);
-            m_device->getAs<D3D12>()->GetPrivateData(IID_ID3D12CommandQueue, &size, set(commandQueue));
+            // GetPrivateData()'s result was never checked here. The command queue is stashed via
+            // SetPrivateDataInterface() in initialize() and explicitly cleared (set to nullptr) in
+            // shutdown() - so a saveToFile() call before initialization completes, after shutdown,
+            // or hitting any other GetPrivateData() failure used to fall through with an empty
+            // commandQueue, handing DirectXTK's SaveWICTextureToFile()/SaveDDSTextureToFile() a
+            // null ID3D12CommandQueue*. Both dereference it early on, so this crashed inside
+            // DirectXTK rather than here - which is exactly the crash signature (an access
+            // violation a few hundred bytes into SaveWICTextureToFile) found in several of the
+            // original toolkit's crash dumps. Fail loudly here instead, with a clear message
+            // pointing at the actual cause, rather than segfaulting inside a third-party helper.
+            if (FAILED(m_device->getAs<D3D12>()->GetPrivateData(IID_ID3D12CommandQueue, &size, set(commandQueue))) ||
+                !commandQueue) {
+                Log("Failed to take screenshot: no command queue available (device not fully "
+                    "initialized, or already shut down)\n");
+                return;
+            }
 
             const auto saveAsDDS = IsEqualGUID(fileFormat, GUID_ContainerFormatDds);
             const auto forceSRGB = IsEqualGUID(fileFormat, GUID_ContainerFormatPng);
@@ -658,7 +721,7 @@ namespace {
                 D3D12_CPU_DESCRIPTOR_HANDLE handle;
                 m_rvHeap.allocate(handle);
                 device->CreateShaderResourceView(get(m_texture), &desc, handle);
-                return std::make_shared<D3D12ResourceView>(m_device, handle);
+                return std::make_shared<D3D12ResourceView>(m_device, handle, &m_rvHeap);
             }
             return nullptr;
         }
@@ -680,7 +743,7 @@ namespace {
                 D3D12_CPU_DESCRIPTOR_HANDLE handle;
                 m_rvHeap.allocate(handle);
                 device->CreateUnorderedAccessView(get(m_texture), nullptr, &desc, handle);
-                return std::make_shared<D3D12ResourceView>(m_device, handle);
+                return std::make_shared<D3D12ResourceView>(m_device, handle, &m_rvHeap);
             }
             return nullptr;
         }
@@ -702,7 +765,7 @@ namespace {
                 D3D12_CPU_DESCRIPTOR_HANDLE handle;
                 m_rtvHeap.allocate(handle);
                 device->CreateRenderTargetView(get(m_texture), &desc, handle);
-                return std::make_shared<D3D12ResourceView>(m_device, handle);
+                return std::make_shared<D3D12ResourceView>(m_device, handle, &m_rtvHeap);
             }
             return nullptr;
         }
@@ -724,7 +787,7 @@ namespace {
                 D3D12_CPU_DESCRIPTOR_HANDLE handle;
                 m_dsvHeap.allocate(handle);
                 device->CreateDepthStencilView(get(m_texture), &desc, handle);
-                return std::make_shared<D3D12ResourceView>(m_device, handle);
+                return std::make_shared<D3D12ResourceView>(m_device, handle, &m_dsvHeap);
             }
             return nullptr;
         }
@@ -1080,6 +1143,8 @@ namespace {
                 }
                 m_currentContext = 0;
                 m_context = m_commandList[0];
+                m_currentDescriptorHeaps[0] = m_currentDescriptorHeaps[1] = nullptr;
+                m_currentDescriptorHeapCount = 0;
             }
 
             // Initialize the native D3D12 text renderer (no D3D11/D3D11on12 interop needed -
@@ -1215,6 +1280,11 @@ namespace {
             CHECK_HRCMD(m_commandAllocator[m_currentContext]->Reset());
             CHECK_HRCMD(m_commandList[m_currentContext]->Reset(get(m_commandAllocator[m_currentContext]), nullptr));
             m_context = m_commandList[m_currentContext];
+            // The (possibly recycled) command list was just Reset(), which clears whatever
+            // descriptor heaps were bound to it before - forget our cached state so the next
+            // bindShaderDescriptorHeaps() call actually rebinds instead of assuming it's current.
+            m_currentDescriptorHeaps[0] = m_currentDescriptorHeaps[1] = nullptr;
+            m_currentDescriptorHeapCount = 0;
         }
 
         std::shared_ptr<ITexture> createTexture(const XrSwapchainCreateInfo& info,
@@ -1434,6 +1504,48 @@ namespace {
                 stopGpuTimestampIndex);
         }
 
+        // All of our SetDescriptorHeaps() call sites (setShader(IQuadShader/IComputeShader) with
+        // {m_rvHeap, m_samplerHeap}, and the simple-mesh renderer with just {m_rvHeap}) bind heaps
+        // that are fixed-size and allocated once in initialize() - they're never replaced for the
+        // lifetime of the device. So in practice the same pointers get hidden to the driver over
+        // and over: every shader switch (multiple times per frame, per postprocess pass) and every
+        // mesh change. Skip the call (a driver/runtime round-trip) whenever the heaps we'd bind are
+        // already the ones bound on m_context. m_currentDescriptorHeaps/m_currentDescriptorHeapCount
+        // are invalidated whenever m_context itself is reset or swapped out (see
+        // initialize()/flushContext()), since a freshly reset command list has no memory of
+        // previously bound heaps.
+        void bindShaderDescriptorHeaps(ID3D12DescriptorHeap* const* heaps, UINT count) {
+            // A plain assert() here is compiled out under NDEBUG (this project's Release config),
+            // so a future caller passing count == 0 or count > ARRAYSIZE(m_currentDescriptorHeaps)
+            // would silently make the std::equal/std::copy calls below read or write past the end
+            // of m_currentDescriptorHeaps in Release. throw survives Release, like the other
+            // invariant checks in this file (see D3D12Heap::allocate()/free() above).
+            if (count == 0 || count > ARRAYSIZE(m_currentDescriptorHeaps)) {
+                throw std::runtime_error("bindShaderDescriptorHeaps: invalid heap count");
+            }
+            if (count == m_currentDescriptorHeapCount &&
+                std::equal(heaps, heaps + count, m_currentDescriptorHeaps)) {
+                return;
+            }
+            m_context->SetDescriptorHeaps(count, heaps);
+            std::copy(heaps, heaps + count, m_currentDescriptorHeaps);
+            m_currentDescriptorHeapCount = count;
+        }
+
+        // Returns the D3D12Shader* base for whichever of m_currentQuadShader/m_currentComputeShader
+        // is currently bound (or nullptr if neither is). Both are always populated by our own
+        // createQuadShader()/createComputeShader(), so the concrete type is known statically and
+        // static_cast is used instead of dynamic_cast to avoid an RTTI lookup on every shader
+        // input/output binding and every dispatch - this runs multiple times per frame.
+        D3D12Shader* currentD3D12Shader() const {
+            if (m_currentComputeShader) {
+                return static_cast<D3D12Shader*>(static_cast<D3D12ComputeShader*>(m_currentComputeShader.get()));
+            } else if (m_currentQuadShader) {
+                return static_cast<D3D12Shader*>(static_cast<D3D12QuadShader*>(m_currentQuadShader.get()));
+            }
+            return nullptr;
+        }
+
         void setShader(std::shared_ptr<IQuadShader> shader, SamplerType sampler) override {
             m_currentQuadShader.reset();
             m_currentComputeShader.reset();
@@ -1443,9 +1555,13 @@ namespace {
                 get(m_rvHeap.heap),
                 get(m_samplerHeap.heap),
             };
-            m_context->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
+            bindShaderDescriptorHeaps(heaps, ARRAYSIZE(heaps));
 
-            auto d3d12Shader = dynamic_cast<D3D12Shader*>(shader.get());
+            // setShader(IQuadShader) is only ever handed shaders created by our own
+            // createQuadShader(), which always constructs a D3D12QuadShader. The concrete type
+            // is therefore known statically, so static_cast avoids the RTTI lookup that
+            // dynamic_cast would otherwise perform on every single draw call.
+            auto d3d12Shader = static_cast<D3D12Shader*>(static_cast<D3D12QuadShader*>(shader.get()));
             if (!d3d12Shader->needsResolve()) {
                 // Prepare to draw the quad.
                 const auto shaderData = shader->getAs<D3D12>();
@@ -1474,9 +1590,11 @@ namespace {
                 get(m_rvHeap.heap),
                 get(m_samplerHeap.heap),
             };
-            m_context->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
+            bindShaderDescriptorHeaps(heaps, ARRAYSIZE(heaps));
 
-            auto d3d12Shader = dynamic_cast<D3D12Shader*>(shader.get());
+            // Same reasoning as in setShader(IQuadShader) above: createComputeShader() always
+            // constructs a D3D12ComputeShader, so the cast is safe and RTTI is unnecessary.
+            auto d3d12Shader = static_cast<D3D12Shader*>(static_cast<D3D12ComputeShader*>(shader.get()));
             if (!d3d12Shader->needsResolve()) {
                 const auto shaderData = shader->getAs<D3D12>();
                 m_context->SetComputeRootSignature(shaderData->rootSignature);
@@ -1492,9 +1610,7 @@ namespace {
         }
 
         void setShaderInput(uint32_t slot, std::shared_ptr<ITexture> input, int32_t slice) override {
-            auto d3d12Shader = m_currentComputeShader ? dynamic_cast<D3D12Shader*>(m_currentComputeShader.get())
-                               : m_currentQuadShader  ? dynamic_cast<D3D12Shader*>(m_currentQuadShader.get())
-                                                      : nullptr;
+            auto d3d12Shader = currentD3D12Shader();
             if (d3d12Shader) {
                 if (m_currentComputeShader) {
                     input->pushState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1520,14 +1636,14 @@ namespace {
         }
 
         void setShaderInput(uint32_t slot, std::shared_ptr<IShaderBuffer> input) override {
-            auto d3d12Shader = m_currentComputeShader ? dynamic_cast<D3D12Shader*>(m_currentComputeShader.get())
-                               : m_currentQuadShader  ? dynamic_cast<D3D12Shader*>(m_currentQuadShader.get())
-                                                      : nullptr;
+            auto d3d12Shader = currentD3D12Shader();
             if (d3d12Shader) {
                 input->pushState(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                 m_currentShaderResources2.push_back(input);
 
-                const auto pBuffer = dynamic_cast<D3D12Buffer*>(input.get());
+                // input is always our own D3D12Buffer (the only IShaderBuffer implementation),
+                // so static_cast avoids the RTTI lookup dynamic_cast would do here.
+                const auto pBuffer = static_cast<D3D12Buffer*>(input.get());
                 const auto descriptorHandle = m_rvHeap.getGPUHandle(pBuffer->getConstantBufferView());
                 if (!d3d12Shader->needsResolve()) {
                     if (m_currentComputeShader) {
@@ -1547,7 +1663,8 @@ namespace {
             if (m_currentQuadShader) {
                 if (!slot) {
                     setRenderTargets(1, &output, &slice);
-                    auto d3d12Shader = dynamic_cast<D3D12Shader*>(m_currentQuadShader.get());
+                    auto d3d12Shader =
+                        static_cast<D3D12Shader*>(static_cast<D3D12QuadShader*>(m_currentQuadShader.get()));
                     if (d3d12Shader->needsResolve()) {
                         d3d12Shader->setOutputFormat(output->getInfo());
                     }
@@ -1560,7 +1677,8 @@ namespace {
 
                 const auto pView = output->getUnorderedAccessView(slice)->getAs<D3D12>();
                 auto descriptorHandle = m_rvHeap.getGPUHandle(*pView);
-                auto d3d12Shader = dynamic_cast<D3D12Shader*>(m_currentComputeShader.get());
+                auto d3d12Shader =
+                    static_cast<D3D12Shader*>(static_cast<D3D12ComputeShader*>(m_currentComputeShader.get()));
                 if (!d3d12Shader->needsResolve()) {
                     m_context->SetComputeRootDescriptorTable(m_currentRootSlot++, descriptorHandle);
                 } else {
@@ -1572,9 +1690,7 @@ namespace {
         }
 
         void dispatchShader(bool doNotClear) const override {
-            auto d3d12Shader = m_currentComputeShader ? dynamic_cast<D3D12Shader*>(m_currentComputeShader.get())
-                               : m_currentQuadShader  ? dynamic_cast<D3D12Shader*>(m_currentQuadShader.get())
-                                                      : nullptr;
+            auto d3d12Shader = currentD3D12Shader();
             if (d3d12Shader) {
                 // The first time, we need to resolve the root signature and create the pipeline state.
                 if (d3d12Shader->needsResolve()) {
@@ -1802,11 +1918,14 @@ namespace {
                 ID3D12DescriptorHeap* const heaps[] = {
                     get(m_rvHeap.heap),
                 };
-                m_context->SetDescriptorHeaps(ARRAYSIZE(heaps), heaps);
+                bindShaderDescriptorHeaps(heaps, ARRAYSIZE(heaps));
 
                 {
-                    auto d3d12Buffer =
-                        dynamic_cast<D3D12Buffer*>(m_meshViewProjectionBuffer[m_currentMeshViewProjectionBuffer].get());
+                    // m_meshViewProjectionBuffer is only ever populated by our own createBuffer(),
+                    // so the concrete type is known statically - static_cast avoids the RTTI
+                    // lookup, consistent with the rest of the shader/buffer binding hot path.
+                    auto d3d12Buffer = static_cast<D3D12Buffer*>(
+                        m_meshViewProjectionBuffer[m_currentMeshViewProjectionBuffer].get());
                     const auto& handle = d3d12Buffer->getConstantBufferView();
                     m_context->SetGraphicsRootDescriptorTable(1, m_rvHeap.getGPUHandle(handle));
                 }
@@ -1831,7 +1950,8 @@ namespace {
             m_meshModelBuffer[m_currentMeshModelBuffer]->uploadData(&model, sizeof(model));
 
             {
-                auto d3d12Buffer = dynamic_cast<D3D12Buffer*>(m_meshModelBuffer[m_currentMeshModelBuffer].get());
+                // Same reasoning: m_meshModelBuffer is only ever populated by createBuffer().
+                auto d3d12Buffer = static_cast<D3D12Buffer*>(m_meshModelBuffer[m_currentMeshModelBuffer].get());
                 const auto& handle = d3d12Buffer->getConstantBufferView();
                 m_context->SetGraphicsRootDescriptorTable(0, m_rvHeap.getGPUHandle(handle));
             }
@@ -1870,8 +1990,7 @@ namespace {
         }
 
         float measureString(std::wstring_view string, TextStyle style, float size) const override {
-            (void)style; // Bold uses the same metrics as Normal for now - see d3d12_textrenderer.h.
-            return m_textRenderer.measureString(string, size);
+            return m_textRenderer.measureString(string, style == TextStyle::Bold, size);
         }
 
         float measureString(std::string_view string, TextStyle style, float size) const override {
@@ -1898,6 +2017,7 @@ namespace {
             m_textRenderer.beginText(get(m_context),
                                      *renderTargetView,
                                      (DXGI_FORMAT)m_currentDrawRenderTarget->getInfo().format,
+                                     m_currentDrawRenderTarget->getInfo().sampleCount,
                                      m_currentDrawRenderTargetViewport.offset.x,
                                      m_currentDrawRenderTargetViewport.offset.y,
                                      m_currentDrawRenderTargetViewport.extent.width,
@@ -1906,6 +2026,17 @@ namespace {
 
         void flushText() override {
             m_textRenderer.flushText();
+
+            // D3D12TextRenderer::flushText() calls SetDescriptorHeaps() directly on the command
+            // list (its own SRV heap for the font atlas) rather than through
+            // bindShaderDescriptorHeaps(), so m_currentDescriptorHeaps is now stale: it still
+            // records whatever heaps were bound before text rendering, while the GPU actually
+            // has the font heap bound. Without this, the next bindShaderDescriptorHeaps() call
+            // that happens to request those same (stale-cached) heaps again would wrongly skip
+            // the real SetDescriptorHeaps() call, leaving that draw sampling through the font
+            // heap instead of its own.
+            m_currentDescriptorHeaps[0] = m_currentDescriptorHeaps[1] = nullptr;
+            m_currentDescriptorHeapCount = 0;
         }
 
         void setMipMapBias(config::MipMapBias biasing, float bias = 0.f) override {
@@ -2230,7 +2361,14 @@ namespace {
                     // target rather than crash; the game's own OMSetRenderTargets call has
                     // already gone through unaffected via the Detours trampoline, this only
                     // skips the toolkit's own post-processing for this one call.
+                    // Evict the stale entry here too: registerRenderTargetView() never removes
+                    // entries on its own (a resource's handle can be reused by
+                    // CreateRenderTargetView(), which does insert_or_assign() and replaces it, but
+                    // a destroyed-and-never-recreated handle would otherwise sit here forever,
+                    // growing the map and re-triggering this same log line on every future call
+                    // that happens to reuse this handle before it's ever recreated).
                     Log("Skipping a stale/invalid D3D12 render target resource\n");
+                    m_renderTargetResourceDescriptors.erase(it);
                     INVOKE_EVENT(unsetRenderTargetEvent, wrappedContext);
                     return;
                 }
@@ -2261,16 +2399,28 @@ namespace {
 
             auto wrappedContext = std::make_shared<D3D12Context>(shared_from_this(), context);
 
-            if (!IsComObjectAlive(pSrcResource) || !IsComObjectAlive(pDstResource)) {
-                // Same reasoning as onSetRenderTargets() above: skip rather than crash on a
-                // stale resource. The game's own CopyTextureRegion/CopyResource call has
-                // already completed via the Detours trampoline; this only skips the
-                // toolkit's own notification/post-processing for this one call.
-                Log("Skipping a stale/invalid D3D12 resource in onCopyTexture\n");
+            // Take real references before touching either resource at all. IsComObjectAlive()
+            // (used previously) is only a probe - it AddRefs then immediately Releases, so it
+            // proves the resource was alive at that instant but leaves a race window open between
+            // the probe returning and the GetDesc() calls right after it: if the game destroys the
+            // resource in that window, GetDesc() dereferences a dangling vtable pointer. The
+            // D3D12Texture constructor already closes this window for its own use of the pointer
+            // (via TryAddRefComObject()), but it does so too late to protect the GetDesc() calls
+            // that need to happen first to build its arguments. Acquiring the reference here,
+            // before GetDesc(), closes the window for the whole function.
+            ComPtr<ID3D12Resource> srcRef, dstRef;
+            if (!TryAddRefComObject(pSrcResource)) {
+                Log("Skipping a stale/invalid D3D12 source resource in onCopyTexture\n");
                 return;
             }
+            attach(srcRef, pSrcResource); // Takes ownership of the reference just added - no second AddRef.
+            if (!TryAddRefComObject(pDstResource)) {
+                Log("Skipping a stale/invalid D3D12 destination resource in onCopyTexture\n");
+                return; // srcRef's destructor releases the source reference we already took.
+            }
+            attach(dstRef, pDstResource);
 
-            const D3D12_RESOURCE_DESC& sourceTextureDesc = pSrcResource->GetDesc();
+            const D3D12_RESOURCE_DESC sourceTextureDesc = pSrcResource->GetDesc();
             auto source = std::make_shared<D3D12Texture>(shared_from_this(),
                                                          getTextureInfo(sourceTextureDesc),
                                                          sourceTextureDesc,
@@ -2280,7 +2430,11 @@ namespace {
                                                          m_dsvHeap,
                                                          m_rvHeap);
 
-            const D3D12_RESOURCE_DESC& destinationTextureDesc = pSrcResource->GetDesc();
+            // Bug fix: this used to read pSrcResource->GetDesc() here, which handed the
+            // destination wrapper the source's dimensions/format/array size/mip count. Every
+            // consumer of `destination` (the copyTextureEvent handler, view creation, getInfo())
+            // was therefore seeing metadata for the wrong resource.
+            const D3D12_RESOURCE_DESC destinationTextureDesc = pDstResource->GetDesc();
             auto destination = std::make_shared<D3D12Texture>(shared_from_this(),
                                                               getTextureInfo(destinationTextureDesc),
                                                               destinationTextureDesc,
@@ -2309,6 +2463,12 @@ namespace {
         size_t m_currentContext{0};
 
         ComPtr<ID3D12GraphicsCommandList> m_context;
+        // Last descriptor heaps bound to m_context via bindShaderDescriptorHeaps(), so it can skip
+        // a redundant SetDescriptorHeaps() call when nothing changed (see below). m_currentDescriptorHeapCount
+        // of 0 means "unknown/none bound yet". Cleared whenever m_context is reset/reassigned, since a
+        // freshly reset command list does not remember any previously bound heaps.
+        ID3D12DescriptorHeap* m_currentDescriptorHeaps[2]{nullptr, nullptr};
+        UINT m_currentDescriptorHeapCount{0};
         D3D12Heap m_rtvHeap;
         D3D12Heap m_dsvHeap;
         D3D12Heap m_rvHeap;
@@ -2336,12 +2496,15 @@ namespace {
 
         d3d12text::D3D12TextRenderer m_textRenderer;
 
+        // These four are read by getViewportSize()/clearColor()/beginText()/draw(), all of which
+        // are reachable before the first setRenderTargets() call - left uninitialized, they held
+        // indeterminate values in that window instead of a well-defined "nothing set yet" state.
         std::shared_ptr<ITexture> m_currentDrawRenderTarget;
-        int32_t m_currentDrawRenderTargetSlice;
-        XrRect2Di m_currentDrawRenderTargetViewport;
+        int32_t m_currentDrawRenderTargetSlice{-1};
+        XrRect2Di m_currentDrawRenderTargetViewport{};
         std::shared_ptr<ITexture> m_currentDrawDepthBuffer;
-        int32_t m_currentDrawDepthBufferSlice;
-        bool m_currentDrawDepthBufferIsInverted;
+        int32_t m_currentDrawDepthBufferSlice{-1};
+        bool m_currentDrawDepthBufferIsInverted{false};
 
         std::shared_ptr<ISimpleMesh> m_currentMesh;
         mutable std::shared_ptr<IQuadShader> m_currentQuadShader;

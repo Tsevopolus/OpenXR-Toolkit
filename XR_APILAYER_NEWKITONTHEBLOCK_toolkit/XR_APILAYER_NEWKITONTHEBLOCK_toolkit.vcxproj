@@ -214,7 +214,6 @@ $(SolutionDir)\patches\sed.exe -i "s/VALUE \"ProductVersion\", \".*\"$/VALUE \"P
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\..\Users\Tsev\Downloads\d3d12_textrenderer.h" />
     <ClInclude Include="..\external\FidelityFX-CAS\ffx-cas\ffx_a.h">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
@@ -239,6 +238,7 @@ $(SolutionDir)\patches\sed.exe -i "s/VALUE \"ProductVersion\", \".*\"$/VALUE \"P
     <ClInclude Include="d3dcommon.h" />
     <ClInclude Include="d3d12_textrenderer.h" />
     <ClInclude Include="detours_helpers.h" />
+    <ClInclude Include="perf_csv_logger.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="shader_utilities.h" />
     <ClInclude Include="factories.h" />
