@@ -97,6 +97,24 @@ namespace {
         }
     }
 
+    // WrapD3D12Texture() used to pass texture->GetDesc() straight into the D3D12Texture
+    // constructor call as an argument - which C++ evaluates BEFORE the constructor (and its own
+    // internal SEH-protected TryAddRefComObject()) ever runs. A dangling `texture` therefore
+    // crashed on GetDesc()'s virtual call before any of the constructor's protection was even
+    // reached. Must stay free of C++ objects with non-trivial destructors (same __try/__except +
+    // object unwinding restriction as IsComObjectAlive()/TryAddRefComObject() above).
+    bool TryGetD3D12ResourceDesc(ID3D12Resource* texture, D3D12_RESOURCE_DESC& outDesc) {
+        if (!texture) {
+            return false;
+        }
+        __try {
+            outDesc = texture->GetDesc();
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
     auto descriptorCompare = [](const D3D12_CPU_DESCRIPTOR_HANDLE& left, const D3D12_CPU_DESCRIPTOR_HANDLE& right) {
         return left.ptr < right.ptr;
     };
@@ -412,7 +430,25 @@ namespace {
 
         virtual ~D3D12ResourceView() {
             if (m_owningHeap) {
-                m_owningHeap->free(m_resourceView);
+                try {
+                    m_owningHeap->free(m_resourceView);
+                } catch (const std::exception& exc) {
+                    // Destructors are implicitly noexcept - an exception escaping one calls
+                    // std::terminate() and kills the process immediately, which is especially
+                    // likely to happen here since this destructor commonly runs *during* stack
+                    // unwinding from another exception (e.g. a D3D12Texture construction failure
+                    // elsewhere in this file). free()'s own invariant check is still useful
+                    // (catches a descriptor that doesn't belong to this heap), but it must stay a
+                    // logged, non-fatal event in a cleanup path rather than a hard crash. Log()
+                    // itself isn't expected to throw (its ofstream path doesn't have exceptions()
+                    // enabled, so it sets failbit rather than throwing), but wrap it anyway -
+                    // belt and braces, since we're already in the one place in this codebase
+                    // where any escaping exception is immediately fatal.
+                    try {
+                        Log("Failed to free a D3D12 descriptor view during cleanup: %s\n", exc.what());
+                    } catch (...) {
+                    }
+                }
             }
         }
 
@@ -517,17 +553,26 @@ namespace {
         void uploadData(const void* buffer, uint32_t rowPitch, int32_t slice = -1) override {
             assert(!(rowPitch % m_device->getTextureAlignmentConstraint()));
 
-            // Create an upload buffer if we don't have one already
-            if (!m_uploadBuffer) {
-                // rowPitch is already a byte pitch (see the alignment assert above), so the
-                // correct buffer size is rowPitch * Height - the same value this function later
-                // hands the GPU via footprint.Footprint.RowPitch below. The previous computation
-                // (alignTo(Width, align) * Height) was a *pixel* count that happened to match
-                // rowPitch * Height only for 1-byte-per-pixel formats; for anything wider it
-                // under-allocated this buffer and under-copied the caller's data into it below,
-                // while the GPU copy still read rowPitch * Height bytes from it - reading past the
-                // end of the allocation.
-                m_uploadSize = rowPitch * m_textureDesc.Height;
+            // rowPitch is already a byte pitch (see the alignment assert above), so the correct
+            // buffer size is rowPitch * Height - the same value this function later hands the GPU
+            // via footprint.Footprint.RowPitch below. The previous computation
+            // (alignTo(Width, align) * Height) was a *pixel* count that happened to match
+            // rowPitch * Height only for 1-byte-per-pixel formats; for anything wider it
+            // under-allocated this buffer and under-copied the caller's data into it below, while
+            // the GPU copy still read rowPitch * Height bytes from it - reading past the end of
+            // the allocation.
+            //
+            // Recompute this on every call, not just the first: m_uploadSize/m_uploadBuffer used
+            // to be set up once inside "if (!m_uploadBuffer)" and never touched again, so a second
+            // uploadData() call on the same texture with a different rowPitch would memcpy() the
+            // FIRST call's (possibly smaller) byte count below while still telling the GPU copy
+            // the NEW rowPitch * Height further down - reading past the end of a buffer that's
+            // now too small for what the GPU is told to expect. Only recreate the actual
+            // committed resource when it needs to grow, so the common case (same rowPitch every
+            // time) still reuses the existing buffer.
+            const UINT requiredUploadSize = rowPitch * m_textureDesc.Height;
+            if (!m_uploadBuffer || requiredUploadSize > m_uploadSize) {
+                m_uploadSize = requiredUploadSize;
                 const auto& heapType = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
                 const auto stagingDesc = CD3DX12_RESOURCE_DESC::Buffer(m_uploadSize);
                 CHECK_HRCMD(m_device->getAs<D3D12>()->CreateCommittedResource(&heapType,
@@ -538,11 +583,15 @@ namespace {
                                                                               IID_PPV_ARGS(set(m_uploadBuffer))));
             }
 
-            // Copy to the upload buffer.
+            // Copy to the upload buffer. Use requiredUploadSize (this call's exact byte count),
+            // not m_uploadSize (the buffer's allocated capacity, which is only ever grown above
+            // and can be larger than what this particular call needs) - otherwise a call with a
+            // smaller rowPitch than a previous call on the same texture would copy more bytes
+            // than `buffer` (sized for the current rowPitch) actually holds.
             {
                 void* mappedBuffer = nullptr;
                 m_uploadBuffer->Map(0, nullptr, &mappedBuffer);
-                memcpy(mappedBuffer, buffer, m_uploadSize);
+                memcpy(mappedBuffer, buffer, requiredUploadSize);
                 m_uploadBuffer->Unmap(0, nullptr);
             }
 
@@ -1249,7 +1298,10 @@ namespace {
         }
 
         void flushContext(bool blocking, bool isEndOfFrame = false) override {
-            if (isEndOfFrame) {
+            // NumQueries == 0 is technically valid but pointless - same guard resolveQueries()
+            // already has, added here too for consistency (cheap either way, and avoids relying
+            // on every future caller remembering it's a no-op).
+            if (isEndOfFrame && m_nextGpuTimestampIndex > 0) {
                 // Resolve the timers.
                 m_context->ResolveQueryData(get(m_queryHeap),
                                             D3D12_QUERY_TYPE_TIMESTAMP,
@@ -1493,7 +1545,21 @@ namespace {
         }
 
         std::shared_ptr<IGpuTimer> createTimer() override {
-            assert(m_nextGpuTimestampIndex < ARRAYSIZE(m_queryBuffer));
+            // A plain assert() here is compiled out under NDEBUG (this project's Release
+            // config) - and unlike D3D12Heap's descriptor slots, GPU timer indices are never
+            // reclaimed (m_nextGpuTimestampIndex only ever increments, for the lifetime of the
+            // device - there is no free-list). Every xrCreateSwapchain() call permanently
+            // consumes a batch of indices, so a session that recreates swapchains a few times
+            // (resolution changes, mission reloads, ...) can exhaust this buffer over time. Once
+            // exhausted, m_queryBuffer[stopIndex] in queryTimeStampDelta() would silently read
+            // and write out of bounds - throwing here turns that into a loud, catchable failure
+            // instead, the same fix already applied to D3D12Heap::allocate()/free() in this file.
+            // The "+ 1" below is not an off-by-one: each createTimer() call consumes TWO
+            // consecutive indices (start and stop), so there must be room for one more index
+            // beyond m_nextGpuTimestampIndex, not just for m_nextGpuTimestampIndex itself.
+            if (m_nextGpuTimestampIndex + 1 >= ARRAYSIZE(m_queryBuffer)) {
+                throw std::runtime_error("D3D12Device: GPU timer query buffer exhausted");
+            }
             const UINT startGpuTimestampIndex = m_nextGpuTimestampIndex++;
             const UINT stopGpuTimestampIndex = m_nextGpuTimestampIndex++;
             return std::make_shared<D3D12GpuTimer>(
@@ -1741,8 +1807,17 @@ namespace {
                               const XrRect2Di* viewport0 = nullptr,
                               std::shared_ptr<ITexture> depthBuffer = nullptr,
                               int32_t depthSlice = -1) override {
-            assert(renderTargets || !numRenderTargets);
-            assert(depthBuffer || depthSlice < 0);
+            // Plain assert()s here are compiled out under NDEBUG (this project's Release
+            // config), same issue already fixed elsewhere in this file (D3D12Heap::allocate/free,
+            // bindShaderDescriptorHeaps) - a caller passing renderTargets == nullptr with
+            // numRenderTargets > 0 would otherwise dereference null in the loop below instead of
+            // failing loudly.
+            if (!renderTargets && numRenderTargets) {
+                throw std::runtime_error("setRenderTargets: renderTargets is null but numRenderTargets > 0");
+            }
+            if (!depthBuffer && depthSlice >= 0) {
+                throw std::runtime_error("setRenderTargets: depthSlice given without a depthBuffer");
+            }
 
             D3D12_CPU_DESCRIPTOR_HANDLE rtvs[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {0};
 
@@ -2011,17 +2086,40 @@ namespace {
             // compatibility but has no effect.
             (void)mustKeepOldContent;
 
+            // Every other place in this file that touches m_currentDrawRenderTarget guards it
+            // with an "if (m_currentDrawRenderTarget)" check first (see unsetRenderTargets(),
+            // setRenderTargets(), clearColor()); this function didn't. It's zero-initialized (a
+            // null shared_ptr) until the first setRenderTargets() call, so calling beginText()
+            // before that - or after unsetRenderTargets() - would otherwise null-deref here. All
+            // current callers happen to call setRenderTargets() first, so this hasn't been
+            // observed in practice, but there's no contract enforcing that order.
+            if (!m_currentDrawRenderTarget) {
+                return;
+            }
+
             auto renderTargetView =
                 m_currentDrawRenderTarget->getRenderTargetView(m_currentDrawRenderTargetSlice)->getAs<D3D12>();
 
-            m_textRenderer.beginText(get(m_context),
-                                     *renderTargetView,
-                                     (DXGI_FORMAT)m_currentDrawRenderTarget->getInfo().format,
-                                     m_currentDrawRenderTarget->getInfo().sampleCount,
-                                     m_currentDrawRenderTargetViewport.offset.x,
-                                     m_currentDrawRenderTargetViewport.offset.y,
-                                     m_currentDrawRenderTargetViewport.extent.width,
-                                     m_currentDrawRenderTargetViewport.extent.height);
+            // ensurePipeline() (called from D3D12TextRenderer::beginText() below) compiles the
+            // text shaders with D3DCompile and builds a PSO with CreateGraphicsPipelineState the
+            // first time a given (format, sampleCount) pair is seen - both can throw
+            // (CHECK_HRESULT/CHECK_HRCMD) on failure. beginText() is reached from xrEndFrame(), a
+            // frame-critical OpenXR entry point that isn't exception-aware, so letting that
+            // escape would be undefined behavior. Since this is purely the menu/overlay text
+            // rendering, catching it here and skipping text for this frame is cheap insurance and
+            // far preferable to crossing the loader boundary with an exception.
+            try {
+                m_textRenderer.beginText(get(m_context),
+                                         *renderTargetView,
+                                         (DXGI_FORMAT)m_currentDrawRenderTarget->getInfo().format,
+                                         m_currentDrawRenderTarget->getInfo().sampleCount,
+                                         m_currentDrawRenderTargetViewport.offset.x,
+                                         m_currentDrawRenderTargetViewport.offset.y,
+                                         m_currentDrawRenderTargetViewport.extent.width,
+                                         m_currentDrawRenderTargetViewport.extent.height);
+            } catch (const std::exception& exc) {
+                Log("Failed to begin text rendering, skipping text for this frame: %s\n", exc.what());
+            }
         }
 
         void flushText() override {
@@ -2314,11 +2412,23 @@ namespace {
             }
         }
 
+// unblockCallbacks() previously sat unconditionally after the event call with nothing
+// protecting it - if any registered handler (e.g. m_frameAnalyzer/m_variableRateShader in
+// layer.cpp) threw, the exception would both (a) escape through whichever Detours hook called
+// this, same UB concern as everywhere else in this file, AND (b) skip unblockCallbacks()
+// entirely, leaving m_blockEvents stuck true FOREVER - silently disabling every future
+// INVOKE_EVENT for the remaining lifetime of this device, since every call site checks
+// !m_blockEvents first. Catching here fixes both: the exception is logged and contained
+// instead of crossing the hook boundary, and unblockCallbacks() always runs.
 #define INVOKE_EVENT(event, ...)                                                                                       \
     do {                                                                                                               \
         if (!m_blockEvents && m_##event) {                                                                             \
             blockCallbacks();                                                                                          \
-            m_##event(##__VA_ARGS__);                                                                                  \
+            try {                                                                                                      \
+                m_##event(##__VA_ARGS__);                                                                              \
+            } catch (const std::exception& exc) {                                                                      \
+                Log("Event handler for '" #event "' threw an exception: %s\n", exc.what());                            \
+            }                                                                                                          \
             unblockCallbacks();                                                                                        \
         }                                                                                                              \
     } while (0);
@@ -2341,49 +2451,73 @@ namespace {
                 return;
             }
 
+            // INVOKE_EVENT ends up calling into layer.cpp's registered handlers
+            // (m_frameAnalyzer/m_variableRateShader) - those must never run while
+            // m_renderTargetResourceDescriptorsLock is held. A handler that happened to call back
+            // into anything taking this same lock would deadlock instead of just failing cleanly.
+            // Every early-exit path below therefore only records what happened; the single
+            // INVOKE_EVENT call for it happens once, after the lock's scope has closed.
             std::shared_ptr<D3D12Texture> renderTarget;
+            bool foundValidTarget = false;
             {
                 std::unique_lock lock(m_renderTargetResourceDescriptorsLock);
 
                 auto it = m_renderTargetResourceDescriptors.find(renderTargetHandles[0]);
-                if (it == m_renderTargetResourceDescriptors.cend()) {
-                    INVOKE_EVENT(unsetRenderTargetEvent, wrappedContext);
-                    return;
+                if (it != m_renderTargetResourceDescriptors.cend()) {
+                    ID3D12Resource* const resource = it->second.first;
+                    const D3D12_RESOURCE_DESC& resourceDesc = it->second.second;
+
+                    if (!IsComObjectAlive(resource)) {
+                        // The game destroyed this resource but our cache (populated by
+                        // registerRenderTargetView()) still points at it - happens around
+                        // resource-heavy transitions like a mission reload. Skip this render
+                        // target rather than crash; the game's own OMSetRenderTargets call has
+                        // already gone through unaffected via the Detours trampoline, this only
+                        // skips the toolkit's own post-processing for this one call.
+                        // Evict the stale entry here too: registerRenderTargetView() never removes
+                        // entries on its own (a resource's handle can be reused by
+                        // CreateRenderTargetView(), which does insert_or_assign() and replaces it,
+                        // but a destroyed-and-never-recreated handle would otherwise sit here
+                        // forever, growing the map and re-triggering this same log line on every
+                        // future call that happens to reuse this handle before it's ever
+                        // recreated).
+                        Log("Skipping a stale/invalid D3D12 render target resource\n");
+                        m_renderTargetResourceDescriptors.erase(it);
+                    } else {
+                        try {
+                            // Despite the IsComObjectAlive() check above, a check-then-use race
+                            // window remains between that probe and the constructor's own
+                            // internal TryAddRefComObject() a few instructions later - if the game
+                            // destroys the resource in that narrow window, the constructor throws
+                            // std::runtime_error. This function is called directly from a Detours
+                            // hook (hooked_ID3D12GraphicsCommandList_OMSetRenderTargets) with
+                            // nothing above it to catch a C++ exception - letting it escape would
+                            // unwind across the hook boundary into the game's own frame loop,
+                            // which is undefined behavior.
+                            renderTarget =
+                                std::make_shared<D3D12Texture>(shared_from_this(),
+                                                               getTextureInfo(resourceDesc),
+                                                               resourceDesc,
+                                                               resource,
+                                                               D3D12_RESOURCE_STATE_COMMON, /* Conservative. */
+                                                               m_rtvHeap,
+                                                               m_dsvHeap,
+                                                               m_rvHeap);
+                            foundValidTarget = true;
+                        } catch (const std::exception& exc) {
+                            Log("Skipping a D3D12 render target that became invalid while wrapping it: %s\n",
+                                exc.what());
+                            m_renderTargetResourceDescriptors.erase(it);
+                        }
+                    }
                 }
-
-                ID3D12Resource* const resource = it->second.first;
-                const D3D12_RESOURCE_DESC& resourceDesc = it->second.second;
-
-                if (!IsComObjectAlive(resource)) {
-                    // The game destroyed this resource but our cache (populated by
-                    // registerRenderTargetView()) still points at it - happens around
-                    // resource-heavy transitions like a mission reload. Skip this render
-                    // target rather than crash; the game's own OMSetRenderTargets call has
-                    // already gone through unaffected via the Detours trampoline, this only
-                    // skips the toolkit's own post-processing for this one call.
-                    // Evict the stale entry here too: registerRenderTargetView() never removes
-                    // entries on its own (a resource's handle can be reused by
-                    // CreateRenderTargetView(), which does insert_or_assign() and replaces it, but
-                    // a destroyed-and-never-recreated handle would otherwise sit here forever,
-                    // growing the map and re-triggering this same log line on every future call
-                    // that happens to reuse this handle before it's ever recreated).
-                    Log("Skipping a stale/invalid D3D12 render target resource\n");
-                    m_renderTargetResourceDescriptors.erase(it);
-                    INVOKE_EVENT(unsetRenderTargetEvent, wrappedContext);
-                    return;
-                }
-
-                renderTarget = std::make_shared<D3D12Texture>(shared_from_this(),
-                                                              getTextureInfo(resourceDesc),
-                                                              resourceDesc,
-                                                              resource,
-                                                              D3D12_RESOURCE_STATE_COMMON, /* Conservative. */
-                                                              m_rtvHeap,
-                                                              m_dsvHeap,
-                                                              m_rvHeap);
             }
 
-            INVOKE_EVENT(setRenderTargetEvent, wrappedContext, renderTarget);
+            if (foundValidTarget) {
+                INVOKE_EVENT(setRenderTargetEvent, wrappedContext, renderTarget);
+            } else {
+                INVOKE_EVENT(unsetRenderTargetEvent, wrappedContext);
+            }
         }
 
         void onCopyTexture(ID3D12GraphicsCommandList* context,
@@ -2420,29 +2554,48 @@ namespace {
             }
             attach(dstRef, pDstResource);
 
-            const D3D12_RESOURCE_DESC sourceTextureDesc = pSrcResource->GetDesc();
-            auto source = std::make_shared<D3D12Texture>(shared_from_this(),
-                                                         getTextureInfo(sourceTextureDesc),
-                                                         sourceTextureDesc,
-                                                         pSrcResource,
-                                                         D3D12_RESOURCE_STATE_COPY_SOURCE, /* Conservative. */
-                                                         m_rtvHeap,
-                                                         m_dsvHeap,
-                                                         m_rvHeap);
+            // srcRef/dstRef above already hold a real, live reference to both resources for the
+            // remainder of this function, so the D3D12Texture constructor's own
+            // TryAddRefComObject() below cannot practically fail here - but this function is
+            // still called directly from a Detours hook
+            // (hooked_ID3D12GraphicsCommandList_CopyTextureRegion) with nothing above it to catch
+            // a C++ exception, so guard it anyway rather than rely on that invariant forever
+            // holding.
+            // Narrowed to just the two D3D12Texture constructions. INVOKE_EVENT used to sit
+            // inside this same try, so an exception thrown by the actual event handler chain
+            // would have been caught right here and mislabeled as "texture became invalid while
+            // wrapping it" - actively misleading when debugging a real event-handler bug.
+            // (INVOKE_EVENT now has its own internal try/catch too, but this stays narrow for
+            // defense in depth.)
+            std::shared_ptr<D3D12Texture> source, destination;
+            try {
+                const D3D12_RESOURCE_DESC sourceTextureDesc = pSrcResource->GetDesc();
+                source = std::make_shared<D3D12Texture>(shared_from_this(),
+                                                        getTextureInfo(sourceTextureDesc),
+                                                        sourceTextureDesc,
+                                                        pSrcResource,
+                                                        D3D12_RESOURCE_STATE_COPY_SOURCE, /* Conservative. */
+                                                        m_rtvHeap,
+                                                        m_dsvHeap,
+                                                        m_rvHeap);
 
-            // Bug fix: this used to read pSrcResource->GetDesc() here, which handed the
-            // destination wrapper the source's dimensions/format/array size/mip count. Every
-            // consumer of `destination` (the copyTextureEvent handler, view creation, getInfo())
-            // was therefore seeing metadata for the wrong resource.
-            const D3D12_RESOURCE_DESC destinationTextureDesc = pDstResource->GetDesc();
-            auto destination = std::make_shared<D3D12Texture>(shared_from_this(),
-                                                              getTextureInfo(destinationTextureDesc),
-                                                              destinationTextureDesc,
-                                                              pDstResource,
-                                                              D3D12_RESOURCE_STATE_COPY_DEST, /* Conservative. */
-                                                              m_rtvHeap,
-                                                              m_dsvHeap,
-                                                              m_rvHeap);
+                // Bug fix: this used to read pSrcResource->GetDesc() here, which handed the
+                // destination wrapper the source's dimensions/format/array size/mip count. Every
+                // consumer of `destination` (the copyTextureEvent handler, view creation,
+                // getInfo()) was therefore seeing metadata for the wrong resource.
+                const D3D12_RESOURCE_DESC destinationTextureDesc = pDstResource->GetDesc();
+                destination = std::make_shared<D3D12Texture>(shared_from_this(),
+                                                             getTextureInfo(destinationTextureDesc),
+                                                             destinationTextureDesc,
+                                                             pDstResource,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, /* Conservative. */
+                                                             m_rtvHeap,
+                                                             m_dsvHeap,
+                                                             m_rvHeap);
+            } catch (const std::exception& exc) {
+                Log("Skipping a D3D12 texture copy that became invalid while wrapping it: %s\n", exc.what());
+                return;
+            }
 
             INVOKE_EVENT(copyTextureEvent, wrappedContext, source, destination, SrcSubresource, DstSubresource);
         }
@@ -2681,10 +2834,20 @@ namespace toolkit::graphics {
         if (device->getApi() == Api::D3D12) {
             SetDebugName(texture, debugName);
 
+            // The caller may have already probed IsComObjectAlive() before this call, but that's
+            // a check-then-use race - texture->GetDesc() called directly as a constructor
+            // argument would run before the constructor's own protection kicks in. Fetch the
+            // desc under SEH first so a resource that became invalid in that window is a clean,
+            // catchable failure instead of a crash.
+            D3D12_RESOURCE_DESC desc{};
+            if (!TryGetD3D12ResourceDesc(texture, desc)) {
+                throw std::runtime_error("Invalid D3D12 resource passed to WrapD3D12Texture");
+            }
+
             auto d3d12Device = dynamic_cast<D3D12Device*>(device.get());
             return std::make_shared<D3D12Texture>(device,
                                                   info,
-                                                  texture->GetDesc(),
+                                                  desc,
                                                   texture,
                                                   initialState,
                                                   d3d12Device->m_rtvHeap,

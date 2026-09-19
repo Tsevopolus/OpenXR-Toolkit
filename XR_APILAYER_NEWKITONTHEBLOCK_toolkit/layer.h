@@ -28,7 +28,7 @@
 namespace toolkit {
 
     const std::string LayerPrettyName = "OpenXR Toolkit — NewKitOnTheBlock Fork";
-    const std::string LayerPrettyNameFull = "OpenXR Toolkit — NewKitOnTheBlock Fork (v1.4.1)";
+    const std::string LayerPrettyNameFull = "OpenXR Toolkit — NewKitOnTheBlock Fork (v1.4.2)";
 
     const std::string LayerName = "XR_APILAYER_NEWKITONTHEBLOCK_toolkit";
     const std::string VersionString = "Unreleased";

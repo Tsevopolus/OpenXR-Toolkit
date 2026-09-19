@@ -204,7 +204,12 @@ namespace {
         bool m_hasSeenRightEye{false};
         bool m_hasCopiedLeftEye{false};
         bool m_hasCopiedRightEye{false};
-        Eye m_firstEyeCopy;
+        // Always written (in onCopyTexture(), on the first copy-out event of a session) before
+        // it's ever read (in prepareForEndFrame(), gated on both m_hasCopiedLeftEye and
+        // m_hasCopiedRightEye being true, which can't happen before that first write) - so this
+        // is not a live bug today, but default-initializing it anyway (matching m_firstEye
+        // below) removes the uninitialized-enum-member smell for good.
+        Eye m_firstEyeCopy{Eye::Left};
         FrameAnalyzerHeuristic m_heuristic{FrameAnalyzerHeuristic::Unknown};
 
         bool m_shouldPredictEye{false};

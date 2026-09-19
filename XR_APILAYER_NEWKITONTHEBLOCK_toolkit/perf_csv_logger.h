@@ -1,6 +1,7 @@
 // MIT License
 //
-// Copyright(c) 2026 Tsevopolus
+// Copyright(c) 2022-2026 Matthieu Bucchianeri
+// Copyright(c) 2021-2022 Jean-Luc Dupiot - Reality XP
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files(the "Software"), to deal
@@ -55,7 +56,18 @@ namespace toolkit::utilities {
             stop();
 
             try {
-                const auto logsDir = std::filesystem::path(getenv("LOCALAPPDATA")) / "OpenXR-Toolkit" / "logs";
+                // getenv() returns nullptr if the variable is unset - std::filesystem::path
+                // constructed from a null const char* is undefined behavior (typically an
+                // immediate crash calling strlen(nullptr) internally), which the surrounding
+                // try/catch would NOT reliably catch since UB isn't guaranteed to surface as a
+                // catchable C++ exception. Extremely unlikely in a normal Windows session, but
+                // this path is explicitly meant to stay resilient even when a session ends in a
+                // crash, so fail this one file gracefully instead.
+                const char* const localAppData = getenv("LOCALAPPDATA");
+                if (!localAppData) {
+                    return {};
+                }
+                const auto logsDir = std::filesystem::path(localAppData) / "OpenXR-Toolkit" / "logs";
                 std::filesystem::create_directories(logsDir);
 
                 // Timestamped so repeated runs never overwrite each other.

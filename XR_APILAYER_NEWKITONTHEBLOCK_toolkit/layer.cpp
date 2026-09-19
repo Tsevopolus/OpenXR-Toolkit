@@ -787,9 +787,31 @@ namespace {
                     m_performanceCounters.overlayCpuTimer = utilities::CreateCpuTimer();
                     m_performanceCounters.handTrackingTimer = utilities::CreateCpuTimer();
 
-                    for (unsigned int i = 0; i <= GpuTimerLatency; i++) {
-                        m_performanceCounters.appGpuTimer[i] = m_graphicsDevice->createTimer();
-                        m_performanceCounters.overlayGpuTimer[i] = m_graphicsDevice->createTimer();
+                    try {
+                        // createTimer() throws std::runtime_error if the GPU timer query buffer
+                        // is exhausted. Nothing in this OpenXR entry point (or anywhere else in
+                        // this file) catches C++ exceptions, so letting this escape would unwind
+                        // across the OpenXR loader's dispatch table into the game - undefined
+                        // behavior. Turning it into a clean XR_ERROR_RUNTIME_FAILURE is
+                        // imperfect (OpenXrApi::xrCreateSession() a few lines above has already
+                        // succeeded, so the runtime now holds a live session the app was just
+                        // told failed to create), but a defined error return beats undefined
+                        // behavior; a full rollback would need to call xrDestroySession() here
+                        // too, which is a larger change than this guard alone.
+                        // Concretely: after this catch returns XR_ERROR_RUNTIME_FAILURE below,
+                        // this layer object still holds fully-constructed m_graphicsDevice,
+                        // m_upscaler, m_postProcessor, m_frameAnalyzer, m_variableRateShader, CPU
+                        // timers and event registrations - but m_vrSession was never assigned, so
+                        // isVrSession(session) returns false on the app's follow-up
+                        // xrDestroySession(), and none of those resources get cleaned up then
+                        // either. Noted as a follow-up, not fixed here.
+                        for (unsigned int i = 0; i <= GpuTimerLatency; i++) {
+                            m_performanceCounters.appGpuTimer[i] = m_graphicsDevice->createTimer();
+                            m_performanceCounters.overlayGpuTimer[i] = m_graphicsDevice->createTimer();
+                        }
+                    } catch (const std::exception& exc) {
+                        Log("Failed to create GPU timers during session creation: %s\n", exc.what());
+                        return XR_ERROR_RUNTIME_FAILURE;
                     }
 
                     m_performanceCounters.lastWindowStart = std::chrono::steady_clock::now();
@@ -1047,106 +1069,124 @@ namespace {
 
             const XrResult result = OpenXrApi::xrCreateSwapchain(session, &chainCreateInfo, swapchain);
             if (XR_SUCCEEDED(result)) {
-                uint32_t imageCount;
-                CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(*swapchain, 0, &imageCount, nullptr));
-                if (!imageCount) {
-                    // Guards the d3dImages[0] access below (and the std::vector(imageCount, ...)
-                    // construction) - a runtime returning 0 images here would otherwise be UB.
-                    // *swapchain is already a real OpenXR handle at this point (xrCreateSwapchain()
-                    // above succeeded) - destroy it before throwing, or it leaks on the runtime
-                    // side and the caller is left holding a handle nobody will ever use or free.
-                    Log("The OpenXR runtime returned 0 swapchain images\n");
-                    OpenXrApi::xrDestroySwapchain(*swapchain);
-                    *swapchain = XR_NULL_HANDLE;
-                    throw std::runtime_error("Runtime returned 0 swapchain images");
-                }
+                // Everything below wraps the runtime's *swapchain handle (already live at this
+                // point - xrCreateSwapchain() above succeeded) with our own processing chain. Any
+                // of these steps can throw (CHECK_XRCMD, the explicit guards below, WrapD3D12Texture,
+                // createTexture, createTimer), and until m_swapchains.insert_or_assign() at the very
+                // end runs, the handle isn't registered anywhere on our side. Uncaught, that throw
+                // would both unwind across the OpenXR loader's dispatch table (undefined behavior -
+                // this function is a C ABI entry point, not exception-aware) and leak the runtime's
+                // swapchain (the app is left holding a handle it can never use, and we never free
+                // it either). The try/catch below turns any of that into a clean
+                // XR_ERROR_RUNTIME_FAILURE and destroys the orphaned handle first.
+                try {
+                    uint32_t imageCount;
+                    CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(*swapchain, 0, &imageCount, nullptr));
+                    if (!imageCount) {
+                        // Guards the d3dImages[0] access below (and the std::vector(imageCount, ...)
+                        // construction) - a runtime returning 0 images here would otherwise be UB.
+                        Log("The OpenXR runtime returned 0 swapchain images\n");
+                        throw std::runtime_error("Runtime returned 0 swapchain images");
+                    }
 
-                SwapchainState swapchainState;
-                int64_t overrideFormat = 0;
-                if (m_graphicsDevice->getApi() == graphics::Api::D3D12) {
-                    std::vector<XrSwapchainImageD3D12KHR> d3dImages(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
-                    CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(
-                        *swapchain,
-                        imageCount,
-                        &imageCount,
-                        reinterpret_cast<XrSwapchainImageBaseHeader*>(d3dImages.data())));
+                    SwapchainState swapchainState;
+                    int64_t overrideFormat = 0;
+                    if (m_graphicsDevice->getApi() == graphics::Api::D3D12) {
+                        std::vector<XrSwapchainImageD3D12KHR> d3dImages(imageCount,
+                                                                         {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+                        CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(
+                            *swapchain,
+                            imageCount,
+                            &imageCount,
+                            reinterpret_cast<XrSwapchainImageBaseHeader*>(d3dImages.data())));
 
-                    // Dump the descriptor for the first texture returned by the runtime for debug purposes.
-                    {
-                        D3D12_RESOURCE_DESC desc{};
-                        if (!TryGetD3D12ResourceDesc(d3dImages[0].texture, desc)) {
-                            Log("The OpenXR runtime returned an invalid D3D12 swapchain image (index 0)\n");
-                            throw std::runtime_error("Invalid D3D12 swapchain image returned by runtime");
+                        // Dump the descriptor for the first texture returned by the runtime for debug purposes.
+                        {
+                            D3D12_RESOURCE_DESC desc{};
+                            if (!TryGetD3D12ResourceDesc(d3dImages[0].texture, desc)) {
+                                Log("The OpenXR runtime returned an invalid D3D12 swapchain image (index 0)\n");
+                                throw std::runtime_error("Invalid D3D12 swapchain image returned by runtime");
+                            }
+                            TraceLoggingWrite(g_traceProvider,
+                                              "RuntimeSwapchain",
+                                              TLArg(desc.Width, "Width"),
+                                              TLArg(desc.Height, "Height"),
+                                              TLArg(desc.DepthOrArraySize, "ArraySize"),
+                                              TLArg(desc.MipLevels, "MipCount"),
+                                              TLArg(desc.SampleDesc.Count, "SampleCount"),
+                                              TLArg((int)desc.Format, "Format"),
+                                              TLArg((int)desc.Flags, "Flags"));
+
+                            // Make sure to create the app texture typeless.
+                            overrideFormat = (int64_t)desc.Format;
                         }
-                        TraceLoggingWrite(g_traceProvider,
-                                          "RuntimeSwapchain",
-                                          TLArg(desc.Width, "Width"),
-                                          TLArg(desc.Height, "Height"),
-                                          TLArg(desc.DepthOrArraySize, "ArraySize"),
-                                          TLArg(desc.MipLevels, "MipCount"),
-                                          TLArg(desc.SampleDesc.Count, "SampleCount"),
-                                          TLArg((int)desc.Format, "Format"),
-                                          TLArg((int)desc.Flags, "Flags"));
 
-                        // Make sure to create the app texture typeless.
-                        overrideFormat = (int64_t)desc.Format;
+                        for (uint32_t i = 0; i < imageCount; i++) {
+                            SwapchainImages images;
+
+                            if (!IsComObjectAlive(d3dImages[i].texture)) {
+                                Log("The OpenXR runtime returned an invalid D3D12 swapchain image (index %u)\n", i);
+                                throw std::runtime_error("Invalid D3D12 swapchain image returned by runtime");
+                            }
+
+                            D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_COMMON;
+                            if ((chainCreateInfo.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
+                                initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                            } else if ((chainCreateInfo.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+                                initialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                            }
+
+                            // Store the runtime images into the state (last entry in the processing chain).
+                            images.runtimeTexture =
+                                graphics::WrapD3D12Texture(m_graphicsDevice,
+                                                           chainCreateInfo,
+                                                           d3dImages[i].texture,
+                                                           initialState,
+                                                           fmt::format("Runtime swapchain {} TEX2D", i));
+
+                            swapchainState.images.push_back(std::move(images));
+                        }
+                    } else {
+                        throw std::runtime_error("Unsupported graphics runtime");
                     }
 
                     for (uint32_t i = 0; i < imageCount; i++) {
-                        SwapchainImages images;
+                        SwapchainImages& images = swapchainState.images[i];
 
-                        if (!IsComObjectAlive(d3dImages[i].texture)) {
-                            Log("The OpenXR runtime returned an invalid D3D12 swapchain image (index %u)\n", i);
-                            throw std::runtime_error("Invalid D3D12 swapchain image returned by runtime");
+                        if (!isDepth) {
+                            // Create an app texture with the exact specification requested (lower resolution in case of
+                            // upscaling).
+                            XrSwapchainCreateInfo inputCreateInfo = *createInfo;
+
+                            // Both post-processor and upscalers need to do sampling.
+                            inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+
+                            images.appTexture = m_graphicsDevice->createTexture(
+                                inputCreateInfo, fmt::format("App swapchain {} TEX2D", i), overrideFormat);
+
+                            // Note: this is a per-view (eye) loop nested inside the per-swapchain-image
+                            // loop above - deliberately named "eye" rather than reusing "i" so it can't
+                            // be mistaken for shadowing the outer loop variable (it doesn't affect
+                            // correctness either way, since "images" was already bound via the outer
+                            // "i" before this loop starts, but the shadowing was a readability trap).
+                            for (uint32_t eye = 0; eye < utilities::ViewCount; eye++) {
+                                images.upscalingTimers[eye] = m_graphicsDevice->createTimer();
+                                images.postProcessingTimers[eye] = m_graphicsDevice->createTimer();
+                            }
+                        } else {
+                            images.appTexture = images.runtimeTexture;
                         }
-
-                        D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_COMMON;
-                        if ((chainCreateInfo.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
-                            initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                        } else if ((chainCreateInfo.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
-                            initialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-                        }
-
-                        // Store the runtime images into the state (last entry in the processing chain).
-                        images.runtimeTexture =
-                            graphics::WrapD3D12Texture(m_graphicsDevice,
-                                                       chainCreateInfo,
-                                                       d3dImages[i].texture,
-                                                       initialState,
-                                                       fmt::format("Runtime swapchain {} TEX2D", i));
-
-                        swapchainState.images.push_back(std::move(images));
                     }
-                } else {
-                    throw std::runtime_error("Unsupported graphics runtime");
+
+                    m_swapchains.insert_or_assign(*swapchain, swapchainState);
+
+                    TraceLoggingWrite(g_traceProvider, "xrCreateSwapchain", TLPArg(*swapchain, "Swapchain"));
+                } catch (const std::exception& exc) {
+                    Log("Failed to set up swapchain: %s\n", exc.what());
+                    OpenXrApi::xrDestroySwapchain(*swapchain);
+                    *swapchain = XR_NULL_HANDLE;
+                    return XR_ERROR_RUNTIME_FAILURE;
                 }
-
-                for (uint32_t i = 0; i < imageCount; i++) {
-                    SwapchainImages& images = swapchainState.images[i];
-
-                    if (!isDepth) {
-                        // Create an app texture with the exact specification requested (lower resolution in case of
-                        // upscaling).
-                        XrSwapchainCreateInfo inputCreateInfo = *createInfo;
-
-                        // Both post-processor and upscalers need to do sampling.
-                        inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-
-                        images.appTexture = m_graphicsDevice->createTexture(
-                            inputCreateInfo, fmt::format("App swapchain {} TEX2D", i), overrideFormat);
-
-                        for (uint32_t i = 0; i < utilities::ViewCount; i++) {
-                            images.upscalingTimers[i] = m_graphicsDevice->createTimer();
-                            images.postProcessingTimers[i] = m_graphicsDevice->createTimer();
-                        }
-                    } else {
-                        images.appTexture = images.runtimeTexture;
-                    }
-                }
-
-                m_swapchains.insert_or_assign(*swapchain, swapchainState);
-
-                TraceLoggingWrite(g_traceProvider, "xrCreateSwapchain", TLPArg(*swapchain, "Swapchain"));
             }
 
             return result;
@@ -2414,9 +2454,25 @@ namespace {
             }
         }
 
+        // Screenshots are a best-effort, opt-in feature triggered from xrEndFrame() (a
+        // frame-critical, non-exception-aware OpenXR entry point). createTexture() below (needed
+        // for the VPRT crop) can throw, and so can the menu-stamping calls further below - rather
+        // than let either escape and unwind across the loader, or lose the whole frame over a
+        // failed screenshot, the entire body is wrapped and any failure just abandons this one
+        // screenshot.
         void takeScreenshot(std::shared_ptr<graphics::ITexture> texture,
                             const std::string& suffix,
                             const XrRect2Di& viewport) const {
+            try {
+                takeScreenshotUnchecked(std::move(texture), suffix, viewport);
+            } catch (const std::exception& exc) {
+                Log("Failed to take screenshot: %s\n", exc.what());
+            }
+        }
+
+        void takeScreenshotUnchecked(std::shared_ptr<graphics::ITexture> texture,
+                                      const std::string& suffix,
+                                      const XrRect2Di& viewport) const {
             // Stamp the overlay/menu if it's active.
             if (m_menuHandler) {
                 m_graphicsDevice->setRenderTargets(1, &texture, nullptr, &viewport);
@@ -2475,6 +2531,20 @@ namespace {
             texture->saveToFile(path);
         }
 
+        // NOTE ON EXCEPTION SAFETY: this function is a C ABI OpenXR entry point (not
+        // exception-aware) called every frame, and its body is long and calls into many things
+        // that can throw (createTexture(), WrapD3D12Texture, the swapchain-state lookups' "not
+        // registered" throws, etc.) - it is NOT fully guarded end-to-end. Only the specific,
+        // most-likely-to-fail sub-operations have their own try/catch, added as they were found:
+        // the menu swapchain creation (createMenuSwapchain(), see its call site below),
+        // screenshot capture (takeScreenshot()), and text rendering setup
+        // (D3D12Device::beginText()). Anything else in this function that throws - e.g. the
+        // "Swapchain is not registered" checks, or a failing createTexture() for the upscaled/
+        // non-VPRT intermediate textures - is still an uncaught, UB-risking escape across the
+        // loader. That's a deliberate, tracked gap (not full coverage), not an oversight: a single
+        // outer try/catch around the whole function would also silently swallow those "this
+        // should never happen" throws, which arguably ought to stay loud. Widening the guarded set
+        // is a candidate for its own follow-up change, not bundled in here.
         XrResult xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) override {
             if (frameEndInfo->type != XR_TYPE_FRAME_END_INFO) {
                 return XR_ERROR_VALIDATION_FAILURE;
@@ -2529,10 +2599,26 @@ namespace {
             if (m_menuHandler) {
                 // Defer creating the menu swapchain to avoid issues with OpenComposite double-initialization.
                 if (m_menuSwapchain == XR_NULL_HANDLE) {
-                    createMenuSwapchain();
+                    // createMenuSwapchain() throws on several paths (0 formats/images returned by
+                    // the runtime, an invalid swapchain image, WrapD3D12Texture, any CHECK_XRCMD).
+                    // xrEndFrame() is a frame-critical entry point called every frame, and - like
+                    // xrCreateSwapchain() above - it's a C ABI OpenXR loader entry point that isn't
+                    // exception-aware, so letting this escape would be undefined behavior. Rather
+                    // than losing the whole frame over a menu-only failure, catch it here, log it,
+                    // and disable the menu for the rest of the session (m_menuHandler is checked
+                    // everywhere else in this function before touching the menu, so resetting it
+                    // is enough to cleanly skip all menu handling/rendering from here on).
+                    try {
+                        createMenuSwapchain();
+                    } catch (const std::exception& exc) {
+                        Log("Failed to create menu swapchain, disabling menu for this session: %s\n", exc.what());
+                        m_menuHandler.reset();
+                    }
                 }
 
-                m_menuHandler->handleInput();
+                if (m_menuHandler) {
+                    m_menuHandler->handleInput();
+                }
             }
 
             // Prepare the Shaders for rendering.

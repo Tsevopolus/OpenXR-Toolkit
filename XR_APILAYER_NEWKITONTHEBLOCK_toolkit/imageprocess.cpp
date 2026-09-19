@@ -178,7 +178,11 @@ namespace {
             using namespace DirectX;
             if (configManager) {
                 static const char* lut[] = {"", "_u1", "_u2", "_u3", "_u4"}; // placeholder up to 4
-                const auto suffix = lut[std::min(index, std::size(lut))];
+                // std::min(index, std::size(lut)) let index == std::size(lut) (5) through as a
+                // valid clamp result, which is one past the last valid element (4) - an
+                // off-by-one that GetPreset() right below gets correct. Not currently reachable
+                // (callers only ever pass 0 or 1), but fixed to the same clamp shape regardless.
+                const auto suffix = lut[std::min(index, std::size(lut) - 1)];
 
                 return {XMINT4(configManager->getValue(SettingPostContrast + suffix),
                                configManager->getValue(SettingPostBrightness + suffix),

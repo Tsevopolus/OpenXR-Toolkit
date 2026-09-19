@@ -80,6 +80,25 @@ namespace {
         }
 
         void tick() override {
+            // m_needRefresh is set asynchronously by the registry watcher's callback (see the
+            // constructor), which can fire on a background thread at any point - including
+            // *during* this very function, after m_wasNeedRefresh below has already been
+            // captured. That's what the XOR below is actually deciding between:
+            //   - m_wasNeedRefresh == m_needRefresh (no new watcher fire happened during this
+            //     tick): the flag reflects nothing new, so clear it - this tick's refreshValue()
+            //     calls above (gated on the OLD m_wasNeedRefresh) already applied whatever
+            //     refresh was pending, so m_ignoreRefresh can be cleared too.
+            //   - m_wasNeedRefresh != m_needRefresh (a watcher fire landed mid-tick, flipping the
+            //     member from false to true - it can only ever flip that direction here, since
+            //     nothing in this function sets it back to false directly): keep the flag set so
+            //     the NEXT tick actually processes that refresh (this tick's loop already decided
+            //     whether to refresh each entry based on the OLD value and won't reconsider), and
+            //     keep m_ignoreRefresh around since it may still matter for a write that's still
+            //     in flight (writeCountdown > 0) when that next refresh happens.
+            // Not a confirmed bug - this reasoning holds for a watcher fire that lands cleanly
+            // before or after the loop - but a fire landing *between* two entries' iterations
+            // isn't covered by the simple both-fields-move-together story above; flagged as worth
+            // a closer look or a regression test rather than changed blind.
             const bool m_wasNeedRefresh = m_needRefresh;
 
             for (auto& value : m_values) {
