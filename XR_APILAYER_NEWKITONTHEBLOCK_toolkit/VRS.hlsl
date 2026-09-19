@@ -91,6 +91,15 @@ void mainCS(in int2 pos : SV_DispatchThreadID) {
 #endif
   else rate = VRS_DEFAULT_RATE;
 
+  // min() means whichever pass writes the SMALLEST (finest) rate value always wins, regardless
+  // of write order. In particular, the C++ side maps SHADING_RATE_CULL to D3D12_SHADING_RATE_4X4
+  // (see resetShadingRates() in vrs.cpp) and the menu labels that setting "Cull outer mask
+  // (HAM)" - but it is not a true cull: if this ring pass computes VRS_DEFAULT_RATE (the finest
+  // rate, 0) for a pixel that a HAM cull pass already marked 4x4, min(4x4, 0) = 0 overwrites the
+  // cull back to full detail. The ring is effectively authoritative over the cull, not the other
+  // way around. This may be the intended behavior (ring as source of truth), but the setting's
+  // name promises something this combiner doesn't deliver - worth a decision on whether to
+  // rename the setting or use a combiner that lets a cull value actually stick.
   u_Output[pos] = min(u_Output[pos], rate);
 }
 

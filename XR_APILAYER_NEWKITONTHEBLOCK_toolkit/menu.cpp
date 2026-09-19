@@ -377,7 +377,6 @@ namespace {
             const float eyeOffset = (eye && eye == Eye::Right) ? rightEyeOffset : 0.f;
 
             const float leftAlign = (viewportSize.width - m_menuBackgroundWidth) / 2 + eyeOffset;
-            const float centerAlign = leftAlign + m_menuBackgroundWidth / 2 + eyeOffset;
             const float rightAlign = leftAlign + m_menuBackgroundWidth + eyeOffset;
             const float topAlign = (viewportSize.height - m_menuBackgroundHeight) / 2;
 
@@ -2271,11 +2270,20 @@ namespace {
     }
 
     void MenuGroup::updateVisibility(bool showExpert) const {
-        int groupVisible = -1; // callback once only when needed
+        // groupVisible is only meaningful once evaluated is true (the group's own m_isVisible()
+        // callback is invoked at most once per call, only when actually needed - it may be
+        // non-trivial). Previously an `int groupVisible = -1` sentinel served both roles at
+        // once (unset vs. false were both "falsy" in the `canShow && groupVisible` check below,
+        // which happened to be safe here since canShow is always false in the branch where
+        // groupVisible is still -1, but that safety wasn't obvious from the code itself).
+        bool evaluated = false;
+        bool groupVisible = false;
         std::for_each_n(&m_menu->m_menuEntries[m_start], m_count, [&](auto& it) {
             auto canShow = (m_isTab || it.visible) && (!it.expert || showExpert);
-            if (canShow && groupVisible < 0)
-                groupVisible = m_isVisible() ? 1 : 0;
+            if (canShow && !evaluated) {
+                groupVisible = m_isVisible();
+                evaluated = true;
+            }
             it.visible = canShow && groupVisible;
         });
     };

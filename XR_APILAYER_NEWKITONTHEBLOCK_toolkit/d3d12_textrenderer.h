@@ -149,7 +149,14 @@ namespace toolkit::graphics::d3d12text {
             // NOTE: vertical alignment (Top/Bottom/VCenter) is not yet implemented - `y` is
             // always treated as the glyph baseline's top, matching TextAlignTop. If the menu
             // relies on FW1_VCENTER/FW1_BOTTOM anywhere, this will need the glyph ascent/
-            // descent metrics added to GlyphInfo and applied here.
+            // descent metrics added to GlyphInfo and applied here. Log instead of silently
+            // mis-rendering if a caller ever passes one of these, so a future regression here
+            // shows up immediately instead of just looking subtly off.
+            if (alignment & (TextAlignBottom | TextAlignVCenter)) {
+                toolkit::log::Log(
+                    "Text renderer: TextAlignBottom/TextAlignVCenter requested but not implemented - "
+                    "treating as top-aligned\n");
+            }
 
             float penY = y;
 
@@ -292,8 +299,21 @@ namespace toolkit::graphics::d3d12text {
         // the pixel shader). Normal's glyphs occupy the top AtlasRows rows, Bold's occupy an
         // identical block of AtlasRows rows directly below - see the class comment.
         void bakeFontAtlas() {
+            // None of CreateFontW/CreateCompatibleDC/CreateDIBSection/SelectObject below were
+            // previously checked for failure (they can all return NULL, e.g. under GDI handle
+            // exhaustion or low memory) - a NULL `bits` from CreateDIBSection in particular would
+            // crash immediately at the unconditional memset() further down. This function runs
+            // from D3D12Device's constructor (via initialize()), so an unhandled crash here takes
+            // down the whole process at startup instead of failing loudly and catchably like the
+            // rest of this codebase's hardened error paths.
             HDC screenDC = GetDC(nullptr);
             HDC memDC = CreateCompatibleDC(screenDC);
+            if (!memDC) {
+                if (screenDC) {
+                    ReleaseDC(nullptr, screenDC);
+                }
+                throw std::runtime_error("D3D12TextRenderer: CreateCompatibleDC failed");
+            }
 
             struct Weight {
                 HFONT font;
@@ -335,10 +355,45 @@ namespace toolkit::graphics::d3d12text {
                  m_glyphsBold},
             };
 
+            for (auto& w : weights) {
+                if (!w.font) {
+                    for (auto& w2 : weights) {
+                        if (w2.font) {
+                            DeleteObject(w2.font);
+                        }
+                    }
+                    DeleteDC(memDC);
+                    ReleaseDC(nullptr, screenDC);
+                    throw std::runtime_error("D3D12TextRenderer: CreateFontW failed");
+                }
+            }
+
             // Put a valid font in the DC before anything else touches it, and remember it so we
             // can restore it below before deleting our own font objects (GDI convention: never
             // delete a font object while it's still selected into a DC).
+            //
+            // The SelectObject() calls further below (re-selecting each weight's font, and
+            // selecting the DIB section into memDC) are deliberately left unchecked: unlike this
+            // first one, their failure mode isn't a crash, just a blank/misrendered atlas (the
+            // previous selection stays in effect and GetTextMetricsW/the glyph drawing loop
+            // below reads/draws against the wrong surface or font instead of faulting). This one
+            // mattered because a subsequent GetTextMetricsW() on a DC with nothing validly
+            // selected reads garbage metrics that size the whole atlas. Left as a deliberate
+            // choice, not an oversight - please don't "harden" the rest to match without a
+            // concrete failure this doesn't already cover.
             HGDIOBJ oldFontForMetrics = SelectObject(memDC, weights[0].font);
+            if (!oldFontForMetrics || oldFontForMetrics == HGDI_ERROR) {
+                // A failure here would otherwise read garbage metrics from GetTextMetricsW()
+                // right below, and the cleanup path further down would pass this same invalid
+                // handle back into SelectObject() when restoring it - consistent with the rest of
+                // this function's GDI hardening, fail loudly instead.
+                for (auto& w : weights) {
+                    DeleteObject(w.font);
+                }
+                DeleteDC(memDC);
+                ReleaseDC(nullptr, screenDC);
+                throw std::runtime_error("D3D12TextRenderer: SelectObject (initial font) failed");
+            }
 
             // Size cells from the FONTS' OWN real metrics rather than guessing. This matters
             // because CreateFontW's height only controls the em-square - actual glyph ink
@@ -370,6 +425,18 @@ namespace toolkit::graphics::d3d12text {
 
             void* bits = nullptr;
             HBITMAP dib = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!dib || !bits) {
+                SelectObject(memDC, oldFontForMetrics);
+                for (auto& w : weights) {
+                    DeleteObject(w.font);
+                }
+                if (dib) {
+                    DeleteObject(dib);
+                }
+                DeleteDC(memDC);
+                ReleaseDC(nullptr, screenDC);
+                throw std::runtime_error("D3D12TextRenderer: CreateDIBSection failed");
+            }
             HGDIOBJ oldBitmap = SelectObject(memDC, dib);
 
             // Clear to black (we only use the atlas as an alpha/coverage mask).

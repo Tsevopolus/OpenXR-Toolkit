@@ -229,7 +229,7 @@ namespace companion
             string friendlyName;
             if (activeLayerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit")
             {
-                friendlyName = "OpenXR Toolkit — NewKitOnTheBlock Fork";
+                friendlyName = "OpenXR Toolkit 1.4.2 (NewKitOnTheBlock)";
             }
             else if (activeLayerName == "XR_APILAYER_MBUCCHIA_toolkit")
             {

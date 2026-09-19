@@ -172,9 +172,9 @@ namespace companion
             this.label4.Location = new System.Drawing.Point(66, 673);
             this.label4.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
             this.label4.Name = "label4";
-            this.label4.Size = new System.Drawing.Size(663, 25);
+            this.label4.Size = new System.Drawing.Size(658, 25);
             this.label4.TabIndex = 9;
-            this.label4.Text = "Screenshots are stored in %LocalAppData%\\OpenXR-Toolkit\\screenshots.";
+            this.label4.Text = "Screenshots are stored in %LocalAppData%\\OpenXR-Toolkit\\screenshots";
             // 
             // openLog
             // 
@@ -469,7 +469,7 @@ namespace companion
             this.layerSelector.FormattingEnabled = true;
             this.layerSelector.Items.AddRange(new object[] {
             " OpenXR Toolkit 1.3.2 (original)",
-            " NewKitOnTheBlock (fork)"});
+            " OpenXR Toolkit 1.4.2 (NewKitOnTheBlock fork)"});
             this.layerSelector.Location = new System.Drawing.Point(25, 309);
             this.layerSelector.Name = "layerSelector";
             this.layerSelector.Size = new System.Drawing.Size(687, 32);
@@ -481,9 +481,9 @@ namespace companion
             this.layerSelectorlabel.AutoSize = true;
             this.layerSelectorlabel.Location = new System.Drawing.Point(24, 268);
             this.layerSelectorlabel.Name = "layerSelectorlabel";
-            this.layerSelectorlabel.Size = new System.Drawing.Size(244, 25);
+            this.layerSelectorlabel.Size = new System.Drawing.Size(251, 25);
             this.layerSelectorlabel.TabIndex = 38;
-            this.layerSelectorlabel.Text = "OpenXR API layer Version";
+            this.layerSelectorlabel.Text = "OpenXR API Layer Version";
             // 
             // pictureBox1
             // 
