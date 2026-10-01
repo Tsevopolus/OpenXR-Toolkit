@@ -2,6 +2,7 @@
 // MIT License
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
+// Copyright(c) 2026      Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -747,11 +748,26 @@ namespace LAYER_NAMESPACE
 	// Auto-generated dispatcher handler.
 	XrResult OpenXrApi::xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function)
 	{
+		// m_xrGetInstanceProcAddr is only set once SetGetInstanceProcAddr() runs, at the end of
+		// xrCreateApiLayerInstance(). It is reachable null here: the free xrGetInstanceProcAddr()
+		// in dispatch.cpp forwards into this singleton (lazily default-constructed by
+		// GetInstance() on first use) for *any* call, including one the loader or another layer
+		// makes with XR_NULL_HANDLE to query global functions before our instance exists yet -
+		// a legitimate call per spec. Calling through a null function pointer would otherwise
+		// crash.
+		if (!m_xrGetInstanceProcAddr)
+		{
+			return XR_ERROR_HANDLE_INVALID;
+		}
+
 		XrResult result = m_xrGetInstanceProcAddr(instance, name, function);
 
 		if (XR_SUCCEEDED(result))
 		{
-			const std::string apiName(name);
+			// This runs on every function an application resolves - often repeatedly - so avoid
+			// the heap allocation a std::string would do here on every single call; string_view
+			// comparison against the literals below is allocation-free.
+			const std::string_view apiName(name);
 
 			if (apiName == "xrDestroyInstance")
 			{

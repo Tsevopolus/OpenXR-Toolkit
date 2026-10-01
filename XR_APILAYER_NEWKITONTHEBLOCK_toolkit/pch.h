@@ -140,3 +140,8 @@ constexpr inline T roundDown(T value, uint32_t pad) noexcept {
 #include <detours.h>
 #include "detours_helpers.h"
 
+// Pimax eye tracker SDK.
+#include <aSeeVRClient.h>
+#include <aSeeVRTypes.h>
+#include <aSeeVRUtility.h>
+

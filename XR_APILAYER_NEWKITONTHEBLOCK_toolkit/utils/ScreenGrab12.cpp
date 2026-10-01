@@ -749,8 +749,25 @@ namespace
         bufferDesc.SampleDesc.Count = 1;
 
         ComPtr<ID3D12Resource> copySource(pSource);
+        // Tracks pSource's own current state for the final transition below, separately from
+        // beforeState (which from here on tracks copySource's state, i.e. the resource that
+        // actually gets COPY_SOURCE'd into the staging buffer - pSource itself in the non-MSAA
+        // case, or the resolved pTemp in the MSAA case).
+        D3D12_RESOURCE_STATES beforeStateSource = beforeState;
         if (desc.SampleDesc.Count > 1)
         {
+            // ResolveSubresource() requires the source in RESOLVE_SOURCE and the destination in
+            // RESOLVE_DEST - transition pSource into it before resolving (it was missing here
+            // before, which left pSource in beforeState for a call that requires RESOLVE_SOURCE).
+            TransitionResource(commandList.Get(), pSource, beforeState, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            // pSource's own actual state is now RESOLVE_SOURCE, not the original beforeState -
+            // record that for the final transition below. Missing this left beforeStateSource at
+            // its initial value (the caller's original beforeState), so with the common
+            // beforeState == afterState case the final TransitionResource became a no-op
+            // (StateBefore == StateAfter) and silently left pSource in RESOLVE_SOURCE instead of
+            // restoring it to afterState.
+            beforeStateSource = D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+
             // MSAA content must be resolved before being copied to a staging texture
             auto descCopy = desc;
             descCopy.SampleDesc.Count = 1;
@@ -762,7 +779,7 @@ namespace
                 &defaultHeapProperties,
                 D3D12_HEAP_FLAG_NONE,
                 &descCopy,
-                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RESOLVE_DEST,
                 nullptr,
                 IID_ID3D12Resource,
                 reinterpret_cast<void**>(pTemp.GetAddressOf()));
@@ -790,7 +807,18 @@ namespace
                 }
             }
 
+            // From here on, copySource (pTemp) is in RESOLVE_DEST - not pSource, which stays in
+            // RESOLVE_SOURCE (tracked via beforeStateSource, untouched below) until the final
+            // transition restores it to afterState.
             copySource = pTemp;
+            beforeState = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        }
+        else
+        {
+            // No resolve: copySource is pSource itself, and the "Transition the resource if
+            // necessary" call below will move it (i.e. pSource) straight to COPY_SOURCE - record
+            // that now so the final transition starts from where pSource actually ends up.
+            beforeStateSource = D3D12_RESOURCE_STATE_COPY_SOURCE;
         }
 
         // Create a staging texture
@@ -807,8 +835,10 @@ namespace
 
         assert(pStaging);
 
-        // Transition the resource if necessary
-        TransitionResource(commandList.Get(), pSource, beforeState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        // Transition the resource if necessary. Uses copySource (not pSource): in the MSAA case
+        // that's pTemp, which pSource was never put into COPY_SOURCE for - only pTemp is about to
+        // be read by CopyTextureRegion below.
+        TransitionResource(commandList.Get(), copySource.Get(), beforeState, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
         // Get the copy target location
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT bufferFootprint = {};
@@ -824,8 +854,10 @@ namespace
         // Copy the texture
         commandList->CopyTextureRegion(&copyDest, 0, 0, 0, &copySrc, nullptr);
 
-        // Transition the resource to the next state
-        TransitionResource(commandList.Get(), pSource, D3D12_RESOURCE_STATE_COPY_SOURCE, afterState);
+        // Transition the source resource to the next state. Always pSource (not copySource) and
+        // beforeStateSource (not beforeState): pSource's own current state, whatever path got it
+        // there (COPY_SOURCE directly, or RESOLVE_SOURCE left over from the MSAA resolve above).
+        TransitionResource(commandList.Get(), pSource, beforeStateSource, afterState);
 
         hr = commandList->Close();
         if (FAILED(hr))
@@ -891,7 +923,7 @@ HRESULT DirectX::SaveDDSTextureToFile(
     D3D12_RESOURCE_STATES beforeState,
     D3D12_RESOURCE_STATES afterState) noexcept
 {
-    if (!fileName)
+    if (!pCommandQ || !pSource || !fileName)
         return E_INVALIDARG;
 
     ComPtr<ID3D12Device> device;
@@ -917,8 +949,14 @@ HRESULT DirectX::SaveDDSTextureToFile(
         &fpRowPitch,
         &totalResourceSize);
 
-    // Round up the srcPitch to multiples of 256
-    const UINT64 dstRowPitch = (fpRowPitch + 255) & ~0xFFu;
+    // Round up the srcPitch to multiples of 256. ~0xFFull (not ~0xFFu): 0xFFu is a 32-bit
+    // unsigned int, so ~0xFFu is 0xFFFFFF00 still as a 32-bit value; when that gets widened to
+    // UINT64 for the & below, it's zero-extended to 0x00000000FFFFFF00, which would silently
+    // clear bits 32-63 of the result for a row pitch large enough to need them. Harmless today
+    // since no real row pitch gets anywhere near 4GB (and the UINT32_MAX check right below would
+    // only ever see an already-truncated value), but the ull suffix keeps the mask 64-bit so
+    // neither of those things has to stay true for this to keep being correct.
+    const UINT64 dstRowPitch = (fpRowPitch + 255) & ~0xFFull;
 
     if (dstRowPitch > UINT32_MAX)
         return HRESULT_E_ARITHMETIC_OVERFLOW;
@@ -1114,14 +1152,17 @@ HRESULT DirectX::SaveWICTextureToFile(
     std::function<void(IPropertyBag2*)> setCustomProps,
     bool forceSRGB)
 {
-    if (!fileName)
+    if (!pCommandQ || !pSource || !fileName)
         return E_INVALIDARG;
 
     ComPtr<ID3D12Device> device;
     pCommandQ->GetDevice(IID_ID3D12Device, reinterpret_cast<void**>(device.GetAddressOf()));
 
-    // Get the size of the image
-    const auto desc = pSource->GetDesc();
+    // Get the size of the image. Non-const (unlike the otherwise-identical declaration in
+    // SaveDDSTextureToFile): this function needs to normalize a typeless format below, and doing
+    // that in place needs a mutable desc rather than a const_cast on a const object, which is
+    // undefined behavior.
+    auto desc = pSource->GetDesc();
 
     if (desc.Width > UINT32_MAX)
         return E_INVALIDARG;
@@ -1140,13 +1181,19 @@ HRESULT DirectX::SaveWICTextureToFile(
         &fpRowPitch,
         &totalResourceSize);
 
-    // Round up the srcPitch to multiples of 256
-    const UINT64 dstRowPitch = (fpRowPitch + 255) & ~0xFFu;
+    // Round up the srcPitch to multiples of 256. ~0xFFull (not ~0xFFu): 0xFFu is a 32-bit
+    // unsigned int, so ~0xFFu is 0xFFFFFF00 still as a 32-bit value; when that gets widened to
+    // UINT64 for the & below, it's zero-extended to 0x00000000FFFFFF00, which would silently
+    // clear bits 32-63 of the result for a row pitch large enough to need them. Harmless today
+    // since no real row pitch gets anywhere near 4GB (and the UINT32_MAX check right below would
+    // only ever see an already-truncated value), but the ull suffix keeps the mask 64-bit so
+    // neither of those things has to stay true for this to keep being correct.
+    const UINT64 dstRowPitch = (fpRowPitch + 255) & ~0xFFull;
 
     if (dstRowPitch > UINT32_MAX)
         return HRESULT_E_ARITHMETIC_OVERFLOW;
 
-    const_cast<D3D12_RESOURCE_DESC&>(desc).Format = EnsureNotTypeless(desc.Format); // HACK
+    desc.Format = EnsureNotTypeless(desc.Format);
 
     ComPtr<ID3D12Resource> pStaging;
     HRESULT hr = CaptureTexture(device.Get(), pCommandQ, pSource, dstRowPitch, desc, pStaging, beforeState, afterState);

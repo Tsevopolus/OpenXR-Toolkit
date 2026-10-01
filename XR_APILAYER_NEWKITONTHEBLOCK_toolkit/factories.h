@@ -136,6 +136,10 @@ namespace toolkit {
 
         std::shared_ptr<input::IEyeTracker>
         CreateEyeTracker(toolkit::OpenXrApi& openXR, std::shared_ptr<toolkit::config::IConfigManager> configManager);
+        std::shared_ptr<input::IEyeTracker>
+        CreateEyeTrackerFB(toolkit::OpenXrApi& openXR, std::shared_ptr<toolkit::config::IConfigManager> configManager);
+        std::shared_ptr<input::IEyeTracker> CreatePimaxEyeTracker(
+            toolkit::OpenXrApi& openXR, std::shared_ptr<toolkit::config::IConfigManager> configManager);
 
     } // namespace input
 

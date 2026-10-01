@@ -2,6 +2,7 @@
 // MIT License
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
+// Copyright(c) 2026      Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -61,9 +62,9 @@ namespace LAYER_NAMESPACE
 			m_instance = instance;
 		}
 
-		void SetUpstreamLayers(std::vector<std::string>& upstreamLayers)
+		void SetUpstreamLayers(std::vector<std::string> upstreamLayers)
 		{
-			m_upstreamLayers = upstreamLayers;
+			m_upstreamLayers = std::move(upstreamLayers);
 		}
 
 		const std::vector<std::string>& GetUpstreamLayers() const
@@ -401,6 +402,10 @@ namespace LAYER_NAMESPACE
 	public:
 		virtual XrResult xrGetVisibilityMaskKHR(XrSession session, XrViewConfigurationType viewConfigurationType, uint32_t viewIndex, XrVisibilityMaskTypeKHR visibilityMaskType, XrVisibilityMaskKHR* visibilityMask)
 		{
+			if (!m_xrGetVisibilityMaskKHR)
+			{
+				return XR_ERROR_FUNCTION_UNSUPPORTED;
+			}
 			return m_xrGetVisibilityMaskKHR(session, viewConfigurationType, viewIndex, visibilityMaskType, visibilityMask);
 		}
 	private:
@@ -409,6 +414,10 @@ namespace LAYER_NAMESPACE
 	public:
 		virtual XrResult xrConvertWin32PerformanceCounterToTimeKHR(XrInstance instance, const LARGE_INTEGER* performanceCounter, XrTime* time)
 		{
+			if (!m_xrConvertWin32PerformanceCounterToTimeKHR)
+			{
+				return XR_ERROR_FUNCTION_UNSUPPORTED;
+			}
 			return m_xrConvertWin32PerformanceCounterToTimeKHR(instance, performanceCounter, time);
 		}
 	private:
@@ -417,6 +426,10 @@ namespace LAYER_NAMESPACE
 	public:
 		virtual XrResult xrCreateHandTrackerEXT(XrSession session, const XrHandTrackerCreateInfoEXT* createInfo, XrHandTrackerEXT* handTracker)
 		{
+			if (!m_xrCreateHandTrackerEXT)
+			{
+				return XR_ERROR_FUNCTION_UNSUPPORTED;
+			}
 			return m_xrCreateHandTrackerEXT(session, createInfo, handTracker);
 		}
 	private:
@@ -425,6 +438,10 @@ namespace LAYER_NAMESPACE
 	public:
 		virtual XrResult xrDestroyHandTrackerEXT(XrHandTrackerEXT handTracker)
 		{
+			if (!m_xrDestroyHandTrackerEXT)
+			{
+				return XR_ERROR_FUNCTION_UNSUPPORTED;
+			}
 			return m_xrDestroyHandTrackerEXT(handTracker);
 		}
 	private:
@@ -433,6 +450,10 @@ namespace LAYER_NAMESPACE
 	public:
 		virtual XrResult xrLocateHandJointsEXT(XrHandTrackerEXT handTracker, const XrHandJointsLocateInfoEXT* locateInfo, XrHandJointLocationsEXT* locations)
 		{
+			if (!m_xrLocateHandJointsEXT)
+			{
+				return XR_ERROR_FUNCTION_UNSUPPORTED;
+			}
 			return m_xrLocateHandJointsEXT(handTracker, locateInfo, locations);
 		}
 	private:

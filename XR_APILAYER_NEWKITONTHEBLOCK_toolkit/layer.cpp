@@ -42,6 +42,42 @@ namespace {
     // 2 frames.
     constexpr uint32_t GpuTimerLatency = 2;
 
+    // Minimal RAII scope guard: runs `fn` when the guard goes out of scope, unless dismiss() was
+    // called first. Used in xrEndFrame() to make sure m_graphicsDevice->blockCallbacks()/
+    // saveContext() are always matched by unblockCallbacks()/restoreContext(), even if an
+    // exception is thrown somewhere in between (the function has several reachable throws in
+    // that range - see the exception-safety comments further down). On the normal path, the
+    // guard is dismiss()'d right at the point where the existing explicit call already happens,
+    // so behavior/timing on the happy path is unchanged.
+    //
+    // Non-copyable and (since it declares a destructor) non-movable by design: it's meant to be
+    // constructed in place via make_scope_exit() and left alone (C++17 guaranteed copy elision
+    // makes that work), not stored, returned, or passed around.
+    template <typename Fn>
+    class ScopeExit {
+      public:
+        explicit ScopeExit(Fn fn) : m_fn(std::move(fn)) {
+        }
+        ~ScopeExit() {
+            if (m_active) {
+                m_fn();
+            }
+        }
+        ScopeExit(const ScopeExit&) = delete;
+        ScopeExit& operator=(const ScopeExit&) = delete;
+        void dismiss() {
+            m_active = false;
+        }
+
+      private:
+        Fn m_fn;
+        bool m_active{true};
+    };
+    template <typename Fn>
+    ScopeExit<Fn> make_scope_exit(Fn fn) {
+        return ScopeExit<Fn>(std::move(fn));
+    }
+
     struct SwapchainImages {
         std::shared_ptr<graphics::ITexture> appTexture;
         std::shared_ptr<graphics::ITexture> runtimeTexture;
@@ -297,6 +333,11 @@ namespace {
                 m_hasVisibilityMaskKHR =
                     XR_SUCCEEDED(xrGetInstanceProcAddr(GetXrInstance(), "xrGetVisibilityMaskKHR", &unused));
             }
+            bool hasEyeTrackerFB = false;
+            {
+                PFN_xrVoidFunction unused;
+                hasEyeTrackerFB = XR_SUCCEEDED(xrGetInstanceProcAddr(GetXrInstance(), "xrCreateEyeTrackerFB", &unused));
+            }
             m_applicationName = createInfo->applicationInfo.applicationName;
             Log("Application name: '%s', Engine name: '%s'\n",
                 createInfo->applicationInfo.applicationName,
@@ -350,10 +391,40 @@ namespace {
                 m_sendInterationProfileEvent = true;
             }
 
+            // ...the Pimax eye tracker, if available.
+            {
+                XrSystemGetInfo getInfo{XR_TYPE_SYSTEM_GET_INFO};
+                getInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+                XrSystemId systemId;
+                if (XR_SUCCEEDED(OpenXrApi::xrGetSystem(GetXrInstance(), &getInfo, &systemId))) {
+                    XrSystemProperties systemProperties{XR_TYPE_SYSTEM_PROPERTIES};
+                    CHECK_XRCMD(OpenXrApi::xrGetSystemProperties(GetXrInstance(), systemId, &systemProperties));
+                    if (std::string(systemProperties.systemName).find("aapvr") != std::string::npos) {
+                        aSeeVRInitParam param;
+                        param.ports[0] = m_configManager->getValue("droolon_port");
+                        Log("--> aSeeVR_connect_server(%d)\n", param.ports[0]);
+                        const auto code = aSeeVR_connect_server(&param);
+                        m_hasPimaxEyeTracker = code == ASEEVR_RETURN_CODE::success;
+                        Log("<-- aSeeVR_connect_server %d\n", code);
+                        if (m_hasPimaxEyeTracker) {
+                            Log("Detected Pimax Droolon support\n");
+                        }
+                    }
+                }
+            }
+
+            // ...otherwise, we will try to fallback to OpenXR (or Meta's XR_FB_eye_tracking_social extension).
+
             // TODO: If Foveated Rendering is disabled, maybe do not initialize the eye tracker?
             if (m_configManager->getValue(config::SettingEyeTrackingEnabled)) {
-                m_eyeTracker = input::CreateEyeTracker(*this, m_configManager);
-                m_needVarjoPollEventWorkaround = m_runtimeName.find("Varjo") != std::string::npos;
+                if (m_hasPimaxEyeTracker) {
+                    m_eyeTracker = input::CreatePimaxEyeTracker(*this, m_configManager);
+                } else if (hasEyeTrackerFB) {
+                    m_eyeTracker = input::CreateEyeTrackerFB(*this, m_configManager);
+                } else {
+                    m_eyeTracker = input::CreateEyeTracker(*this, m_configManager);
+                    m_needVarjoPollEventWorkaround = m_runtimeName.find("Varjo") != std::string::npos;
+                }
             }
 
             // Clear HAM-related events so they don't fire off unnecessarily.
@@ -472,9 +543,12 @@ namespace {
 
                 m_supportHandTracking = handTrackingSystemProperties.supportsHandTracking;
                 m_supportEyeTracking = eyeTrackingSystemProperties.supportsEyeGazeInteraction ||
-                                       eyeTrackingFBSystemProperties.supportsEyeTracking ||
+                                       eyeTrackingFBSystemProperties.supportsEyeTracking || m_hasPimaxEyeTracker ||
                                        m_configManager->getValue(config::SettingEyeDebugWithController);
-                const bool isEyeTrackingThruRuntime = m_supportEyeTracking;
+                // The Pimax path doesn't go through the runtime's own eye-tracking properties/
+                // extensions at all (it's a side-channel to the aSeeVR SDK), so the WMR
+                // fake-gaze-interaction workaround below doesn't apply to it.
+                const bool isEyeTrackingThruRuntime = m_supportEyeTracking && !m_hasPimaxEyeTracker;
 
                 // Workaround: the WMR runtime supports mapping the VR controllers through XR_EXT_hand_tracking, which
                 // will (falsely) advertise hand tracking support. Check for the Ultraleap layer in this case.
@@ -2291,7 +2365,10 @@ namespace {
                     char buf[1024];
                     std::strftime(buf, sizeof(buf), "stats_%Y%m%d_%H%M%S", std::localtime(&now));
                     std::string logFile = (localAppData / "stats" / (std::string(buf) + ".csv")).string();
-                    m_logStats.open(logFile, std::ios_base::ate);
+                    // The filename already embeds a second-resolution timestamp, so a collision
+                    // with a pre-existing file is very unlikely - but if one happens, truncate it
+                    // instead of appending our CSV header/rows onto unrelated old content.
+                    m_logStats.open(logFile, std::ios_base::trunc);
 
                     // Write headers.
                     m_logStats << "time,FPS,appCPU (us),renderCPU (us),appGPU (us),VRAM (MB),VRAM (%)\n";
@@ -2473,14 +2550,32 @@ namespace {
         void takeScreenshotUnchecked(std::shared_ptr<graphics::ITexture> texture,
                                       const std::string& suffix,
                                       const XrRect2Di& viewport) const {
-            // Stamp the overlay/menu if it's active.
-            if (m_menuHandler) {
-                m_graphicsDevice->setRenderTargets(1, &texture, nullptr, &viewport);
+            // Stamp the overlay/menu if it's active - but only in the (default) quad-layer menu
+            // mode, where the menu is NOT part of `texture` yet. `texture` there is the actual
+            // runtime/presented swapchain image (see xrEndFrame()'s call site,
+            // textureForOverlay[eye] = swapchainImages.runtimeTexture), so rendering the menu
+            // directly onto it would bake the menu into the frame the runtime is about to
+            // display, not just into this screenshot - hence stamping into a scratch copy here
+            // instead. `texture` is a local by-value copy of the shared_ptr, so reassigning it
+            // below only affects what the rest of this function (crop + saveToFile) operates on,
+            // not the caller's swapchain texture.
+            //
+            // In legacy menu mode, xrEndFrame()'s overlay pass already renders the menu directly
+            // into textureForOverlay[eye] (i.e. into `texture`, by the time we get here), so
+            // stamping it again here would draw the menu onto the screenshot twice.
+            if (m_menuHandler && !m_configManager->getValue(config::SettingMenuLegacyMode)) {
+                auto stampInfo = texture->getInfo();
+                auto stamped = m_graphicsDevice->createTexture(stampInfo, "ScreenshotMenuStamp");
+                texture->copyTo(stamped);
+
+                m_graphicsDevice->setRenderTargets(1, &stamped, nullptr, &viewport);
                 m_graphicsDevice->beginText(true /* mustKeepOldContent */);
-                m_menuHandler->render(texture);
+                m_menuHandler->render(stamped);
                 m_graphicsDevice->flushText();
 
                 m_graphicsDevice->unsetRenderTargets();
+
+                texture = stamped;
             }
 
             SYSTEMTIME st;
@@ -2581,8 +2676,13 @@ namespace {
                 m_frameAnalyzer->prepareForEndFrame();
             }
 
-            // TODO: Ensure restoreContext() even on error.
             m_graphicsDevice->blockCallbacks();
+            // Guarantees unblockCallbacks() runs even if an exception escapes before we reach the
+            // explicit call below (e.g. from createMenuSwapchain(), createTexture() in the
+            // VPRT/upscale paths, or WrapD3D12Texture() further down in this function). On the
+            // normal path, it is dismissed right where unblockCallbacks() is already called
+            // explicitly, so timing there is unchanged.
+            auto unblockCallbacksGuard = make_scope_exit([&] { m_graphicsDevice->unblockCallbacks(); });
 
             if (m_eyeTracker) {
                 m_eyeTracker->endFrame();
@@ -2594,6 +2694,8 @@ namespace {
             }
 
             m_graphicsDevice->saveContext();
+            // Same idea as unblockCallbacksGuard, for restoreContext().
+            auto restoreContextGuard = make_scope_exit([&] { m_graphicsDevice->restoreContext(); });
 
             // Handle inputs.
             if (m_menuHandler) {
@@ -3141,8 +3243,9 @@ namespace {
                             static const XrEyeVisibility visibility[] = {
                                 XR_EYE_VISIBILITY_BOTH, XR_EYE_VISIBILITY_LEFT, XR_EYE_VISIBILITY_RIGHT};
                             layerQuadForMenu.eyeVisibility =
-                                visibility[std::min(m_configManager->getValue(config::SettingMenuEyeVisibility),
-                                                    (int)std::size(visibility))];
+                                visibility[std::clamp(m_configManager->getValue(config::SettingMenuEyeVisibility),
+                                                      0,
+                                                      (int)std::size(visibility) - 1)];
                             layerQuadForMenu.subImage.swapchain = m_menuSwapchain;
                             layerQuadForMenu.subImage.imageRect.extent.width = textureInfo.width;
                             layerQuadForMenu.subImage.imageRect.extent.height = textureInfo.height;
@@ -3218,7 +3321,11 @@ namespace {
                 }
             }
 
+            // Call the real cleanup first and only dismiss the guard once it has actually
+            // succeeded - dismissing first would disarm the guard before we know restoreContext()
+            // didn't throw, defeating its purpose.
             m_graphicsDevice->restoreContext();
+            restoreContextGuard.dismiss();
             m_graphicsDevice->flushContext(false, true);
 
             // Release the swapchain images now, as we are really done this time.
@@ -3276,7 +3383,10 @@ namespace {
 
                 const auto result = OpenXrApi::xrEndFrame(session, &chainFrameEndInfo);
 
+                // Same reasoning as restoreContextGuard above: call first, dismiss only after it
+                // actually succeeded.
                 m_graphicsDevice->unblockCallbacks();
+                unblockCallbacksGuard.dismiss();
 
                 if (m_configManager->getValue(config::SettingTurboMode) && !m_asyncWaitPromise.valid()) {
                     m_asyncWaitPolled = false;
@@ -3441,7 +3551,7 @@ namespace {
         // could reach setViewProjectionCenters()/the menu/VRS before calibration ever succeeds.
         XrVector2f m_projCenters[utilities::ViewCount]{};
         XrVector2f m_eyeGaze[utilities::ViewCount]{};
-        XrView m_posesForFrame[utilities::ViewCount];
+        XrView m_posesForFrame[utilities::ViewCount]{};
         std::chrono::time_point<std::chrono::steady_clock> m_lastFrameWaitTimestamp{};
         uint32_t m_frameThrottleSleepOffset{0};
 
@@ -3503,6 +3613,7 @@ namespace {
         std::ofstream m_logStats;
         bool m_hasPerformanceCounterKHR{false};
         bool m_hasVisibilityMaskKHR{false};
+        bool m_hasPimaxEyeTracker{false};
     };
 
     std::unique_ptr<OpenXrLayer> g_instance = nullptr;

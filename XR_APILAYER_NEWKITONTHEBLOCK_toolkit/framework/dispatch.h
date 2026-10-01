@@ -1,6 +1,7 @@
 // MIT License
 //
 // Copyright(c) 2021 Matthieu Bucchianeri
+// Copyright(c) 2026 Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -28,12 +29,20 @@
 
 namespace LAYER_NAMESPACE {
 
-    XrResult xrGetInstanceProcAddr(XrInstance instance,
-                                   const char* name,
-                                   PFN_xrVoidFunction* function);
-    XrResult xrDestroyInstance(XrInstance instance);
-    XrResult xrCreateApiLayerInstance(const XrInstanceCreateInfo* instanceCreateInfo,
-                                      const struct XrApiLayerCreateInfo* apiLayerInfo,
-                                      XrInstance* instance);
+    // These three are loader/API-layer ABI entry points: their addresses are handed to the
+    // loader (via apiLayerRequest->getInstanceProcAddr/createApiLayerInstance in entry.cpp) and
+    // called back through PFN_xrGetInstanceProcAddr/PFN_xrCreateApiLayerInstance function-pointer
+    // types, which - per the OpenXR headers - carry the XRAPI_CALL calling-convention macro. On
+    // Win64 XRAPI_CALL is a no-op so this currently makes no ABI difference, but on Win32 it
+    // expands to __stdcall; without it here, entry.cpp's reinterpret_cast to the XRAPI_CALL
+    // function-pointer types would silently paper over a calling-convention mismatch (cdecl vs
+    // stdcall) that corrupts the stack on every call.
+    XrResult XRAPI_CALL xrGetInstanceProcAddr(XrInstance instance,
+                                              const char* name,
+                                              PFN_xrVoidFunction* function);
+    XrResult XRAPI_CALL xrDestroyInstance(XrInstance instance);
+    XrResult XRAPI_CALL xrCreateApiLayerInstance(const XrInstanceCreateInfo* instanceCreateInfo,
+                                                 const struct XrApiLayerCreateInfo* apiLayerInfo,
+                                                 XrInstance* instance);
 
 } // namespace LAYER_NAMESPACE

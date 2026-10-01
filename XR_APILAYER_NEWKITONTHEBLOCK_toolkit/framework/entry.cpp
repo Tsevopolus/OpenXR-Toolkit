@@ -1,6 +1,7 @@
 // MIT License
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
+// Copyright(c) 2026 Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -73,7 +74,16 @@ XrResult __declspec(dllexport) XRAPI_CALL
     }
 
     // Create the necessary subfolders in LocalAppData (if they don't exist).
-    localAppData = std::filesystem::path(getenv("LOCALAPPDATA")) / LayerPrettyName;
+    // getenv() can return nullptr (stripped environments, some CI containers/service accounts),
+    // and std::filesystem::path(nullptr) is undefined behavior - guard it and fall back to
+    // dllHome (or, if that's empty too, the current working directory) so we still have
+    // somewhere writable to log to rather than silently writing relative paths later.
+    if (const char* localAppDataEnv = getenv("LOCALAPPDATA")) {
+        localAppData = std::filesystem::path(localAppDataEnv) / LayerPrettyName;
+    } else {
+        DebugLog("LOCALAPPDATA is not set, falling back to dllHome\n");
+        localAppData = (!dllHome.empty() ? dllHome : std::filesystem::current_path()) / LayerPrettyName;
+    }
     CreateDirectoryA(localAppData.string().c_str(), nullptr);
     CreateDirectoryA((localAppData / "logs").string().c_str(), nullptr);
     CreateDirectoryA((localAppData / "stats").string().c_str(), nullptr);

@@ -35,6 +35,7 @@ namespace {
     using namespace toolkit::utilities;
     using namespace toolkit::log;
 
+
     using namespace xr::math;
 
     class EyeTrackerBase : public IEyeTracker {
@@ -264,11 +265,13 @@ namespace {
                 location.pose.position.x = location.pose.position.y = location.pose.position.z = 0.f;
             }
 
+            // Project 2m forward along the gaze orientation. In debug-with-controller mode, the
+            // position was just zeroed above (to discard the controller's translational offset),
+            // but the orientation is kept, so this still yields a meaningful, non-degenerate
+            // direction instead of the (0,0,0) null vector the old code produced here.
             const auto gaze = LoadXrPose(location.pose);
             const auto gazeProjectedPoint =
-                m_debugWithController
-                    ? LoadXrVector3(location.pose.position)
-                    : DirectX::XMVector3Transform(DirectX::XMVectorSet(0, 0, 2, 1) /* 2m forward */, gaze);
+                DirectX::XMVector3Transform(DirectX::XMVectorSet(0, 0, 2, 1) /* 2m forward */, gaze);
 
             projectedPoint.x = gazeProjectedPoint.m128_f32[0];
             projectedPoint.y = gazeProjectedPoint.m128_f32[1];
@@ -287,6 +290,260 @@ namespace {
         XrSpace m_eyeSpace{XR_NULL_HANDLE};
     };
 
+    // Meta/Oculus eye tracking via the XR_FB_eye_tracking_social extension. No third-party SDK
+    // needed - this is a standard OpenXR extension, loaded dynamically like the other optional
+    // extensions this layer uses (see xrCreateInstance()'s hasEyeTrackerFB detection).
+    class OpenXrFBEyeTracker : public EyeTrackerBase {
+      public:
+        OpenXrFBEyeTracker(OpenXrApi& openXR, std::shared_ptr<IConfigManager> configManager)
+            : EyeTrackerBase(openXR, configManager) {
+            CHECK_XRCMD(m_openXR.xrGetInstanceProcAddr(m_openXR.GetXrInstance(),
+                                                       "xrCreateEyeTrackerFB",
+                                                       reinterpret_cast<PFN_xrVoidFunction*>(&m_xrCreateEyeTrackerFB)));
+            CHECK_XRCMD(
+                m_openXR.xrGetInstanceProcAddr(m_openXR.GetXrInstance(),
+                                               "xrDestroyEyeTrackerFB",
+                                               reinterpret_cast<PFN_xrVoidFunction*>(&m_xrDestroyEyeTrackerFB)));
+            CHECK_XRCMD(m_openXR.xrGetInstanceProcAddr(m_openXR.GetXrInstance(),
+                                                       "xrGetEyeGazesFB",
+                                                       reinterpret_cast<PFN_xrVoidFunction*>(&m_xrGetEyeGazesFB)));
+        }
+
+        ~OpenXrFBEyeTracker() override {
+        }
+
+        void beginSession(XrSession session) override {
+            EyeTrackerBase::beginSession(session);
+
+            // Create the resources for the eye tracker.
+            XrEyeTrackerCreateInfoFB createInfo{XR_TYPE_EYE_TRACKER_CREATE_INFO_FB};
+            const XrResult result = m_xrCreateEyeTrackerFB(session, &createInfo, &m_eyeTracker);
+            if (XR_FAILED(result)) {
+                if (result != XR_ERROR_RUNTIME_FAILURE) {
+                    CHECK_XRCMD(result);
+                } else {
+                    Log("xrCreateEyeTrackerFB() failed with XR_ERROR_RUNTIME_FAILURE! This is an Oculus platform "
+                        "software bug, please file a report to Meta!\n");
+                }
+            }
+        }
+
+        void endSession() override {
+            if (m_eyeTracker != XR_NULL_HANDLE) {
+                m_xrDestroyEyeTrackerFB(m_eyeTracker);
+                m_eyeTracker = XR_NULL_HANDLE;
+            }
+
+            EyeTrackerBase::endSession();
+        }
+
+        bool getEyeGaze(XrVector3f& projectedPoint) const override {
+            if (m_eyeTracker == XR_NULL_HANDLE) {
+                return false;
+            }
+
+            XrEyeGazesInfoFB eyeGazeInfo{XR_TYPE_EYE_GAZES_INFO_FB};
+            eyeGazeInfo.baseSpace = m_viewSpace;
+            eyeGazeInfo.time = m_frameTime;
+
+            XrEyeGazesFB eyeGaze{XR_TYPE_EYE_GAZES_FB};
+
+            CHECK_XRCMD(m_xrGetEyeGazesFB(m_eyeTracker, &eyeGazeInfo, &eyeGaze));
+
+            if (!(eyeGaze.gaze[0].isValid && eyeGaze.gaze[1].isValid)) {
+                return false;
+            }
+
+            if (!(eyeGaze.gaze[0].gazeConfidence > 0.5f && eyeGaze.gaze[1].gazeConfidence > 0.5f)) {
+                return false;
+            }
+
+            // Average the poses from both eyes.
+            const auto gaze = LoadXrPose(Pose::Slerp(eyeGaze.gaze[0].gazePose, eyeGaze.gaze[1].gazePose, 0.5f));
+            const auto gazeProjectedPoint =
+                DirectX::XMVector3Transform(DirectX::XMVectorSet(0, 0, m_projectionDistance, 1), gaze);
+
+            projectedPoint.x = gazeProjectedPoint.m128_f32[0];
+            projectedPoint.y = gazeProjectedPoint.m128_f32[1];
+            projectedPoint.z = gazeProjectedPoint.m128_f32[2];
+
+            return true;
+        }
+
+        bool isProjectionDistanceSupported() const {
+            return true;
+        }
+
+      private:
+        PFN_xrCreateEyeTrackerFB m_xrCreateEyeTrackerFB{nullptr};
+        PFN_xrDestroyEyeTrackerFB m_xrDestroyEyeTrackerFB{nullptr};
+        PFN_xrGetEyeGazesFB m_xrGetEyeGazesFB{nullptr};
+
+        XrEyeTrackerFB m_eyeTracker{XR_NULL_HANDLE};
+        XrSpace m_eyeSpace{XR_NULL_HANDLE};
+    };
+
+    // Pimax's aSeeVR eye tracker (Droolon add-on), via the proprietary aSeeVRClient SDK
+    // (external/aSeeVRClient). Callback-driven: the SDK pushes state/eye-data/coefficient updates
+    // on its own thread via aSeeVR_register_callback(), rather than us polling it.
+    class PimaxEyeTracker : public EyeTrackerBase {
+      public:
+        PimaxEyeTracker(OpenXrApi& openXR, std::shared_ptr<IConfigManager> configManager)
+            : EyeTrackerBase(openXR, configManager), m_state(std::make_unique<SharedState>().release()) {
+            // Registered callbacks run on the SDK's own thread and only ever touch `m_state`
+            // (see SharedState below) - never `this` - so there is nothing here for the
+            // destructor to detach, and no need to keep `this` alive for their duration.
+            //
+            // aSeeVR_register_callback()'s second parameter is declared as a generic `void*`,
+            // not a typed function-pointer typedef (per the aSeeVR UserSDK headers), and converting
+            // a function pointer to void* is not an implicit standard conversion in C++. This
+            // project builds with ConformanceMode (/permissive-), which rejects the non-standard
+            // implicit conversion MSVC otherwise tolerates - hence the explicit casts below.
+            aSeeVR_register_callback(
+                aSeeVRCallbackType::state, reinterpret_cast<void*>(stateCallback), m_state);
+            aSeeVR_register_callback(
+                aSeeVRCallbackType::eye_data, reinterpret_cast<void*>(eyeDataCallback), m_state);
+            aSeeVR_register_callback(
+                aSeeVRCallbackType::coefficient, reinterpret_cast<void*>(getCoefficientCallback), m_state);
+        }
+
+        ~PimaxEyeTracker() override {
+            endSession();
+
+            // The aSeeVR SDK offers no callback-unregister API, so a callback can still be in
+            // flight on the SDK's own thread (or arrive late) after this destructor runs. Since
+            // callbacks only ever touch `m_state` - a self-contained, independently
+            // mutex-guarded block - and never `this` or any other member of this class, it is
+            // safe to destroy `this` at any time without further synchronization here.
+            // `m_state` itself is intentionally never deleted (see SharedState) - that's not a
+            // per-call leak, just a one-time, bounded leak per PimaxEyeTracker instance. Note
+            // that this tracker is constructed once per OpenXR instance (see xrCreateInstance()
+            // in layer.cpp), not once per session, so this leak cannot accumulate across the
+            // many sessions an application may create against one instance.
+        }
+
+        void beginSession(XrSession session) override {
+            EyeTrackerBase::beginSession(session);
+
+            const auto status = aSeeVR_get_coefficient();
+            if (status != ASEEVR_RETURN_CODE::success) {
+                Log("aSeeVR_get_coefficient failed with: %d\n", status);
+            }
+        }
+
+        void endSession() override {
+            // Assumed idempotent: endSession() (and therefore aSeeVR_stop()) can run twice over
+            // this object's lifetime if the application destroys and later recreates its
+            // session, since both xrDestroySession and the destructor route through here.
+            aSeeVR_stop();
+
+            EyeTrackerBase::endSession();
+        }
+
+        bool getEyeGaze(XrVector3f& projectedPoint) const override {
+            std::lock_guard<std::mutex> lock(m_state->mutex);
+
+            if (!m_state->isDeviceReady) {
+                return false;
+            }
+
+            // TODO: Use timestamp to implement a timeout.
+
+            // The point is projected onto a screen at Z = -m_projectionDistance.
+            projectedPoint.x = m_state->recommendedGaze.x - 0.5f;
+            projectedPoint.y = m_state->recommendedGaze.y - 0.5f;
+            projectedPoint.z = -m_projectionDistance;
+
+            return true;
+        }
+
+        bool isProjectionDistanceSupported() const {
+            return true;
+        }
+
+      private:
+        // State written by the SDK's callback thread and read by getEyeGaze() on the render
+        // thread, guarded by its own mutex. Allocated once via `new` (through
+        // std::make_unique(...).release(), so construction failure can't leak it) and never
+        // deleted: the aSeeVR SDK offers no callback-unregister API, so a callback could still
+        // land on this address after the owning PimaxEyeTracker is destroyed, and freeing it
+        // would turn that into a use-after-free. Deliberately holding no pointer back to the
+        // owning PimaxEyeTracker keeps this independent of that object's lifetime entirely.
+        struct SharedState {
+            std::mutex mutex;
+            bool isDeviceReady{false};
+            XrVector2f recommendedGaze{0, 0};
+            aSeeVRCoefficient coefficients{};
+            int64_t lastTimestamp{0};
+        };
+
+        SharedState* const m_state;
+
+        static void _7INVENSUN_CALL stateCallback(const aSeeVRState* state, void* context) {
+            if (!state) {
+                return;
+            }
+
+            switch (state->code) {
+            case aSeeVRStateCode::api_start:
+                Log("aSeeVR_start completed with: %d\n", state->error);
+                break;
+
+            case aSeeVRStateCode::api_stop:
+                Log("aSeeVR_stop completed with: %d\n", state->error);
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        static void _7INVENSUN_CALL eyeDataCallback(const aSeeVREyeData* eyeData, void* context) {
+            if (!eyeData) {
+                return;
+            }
+
+            int64_t timestamp = 0;
+            aSeeVR_get_int64(eyeData, aSeeVREye::undefine_eye, aSeeVREyeDataItemType::timestamp, &timestamp);
+
+            aSeeVRPoint2D point2D = {0};
+            aSeeVR_get_point2d(eyeData, aSeeVREye::undefine_eye, aSeeVREyeDataItemType::gaze, &point2D);
+
+            auto* state = reinterpret_cast<SharedState*>(context);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->recommendedGaze = {point2D.x, point2D.y};
+            state->lastTimestamp = timestamp;
+        }
+
+        static void _7INVENSUN_CALL getCoefficientCallback(const aSeeVRCoefficient* data, void* context) {
+            if (!data) {
+                return;
+            }
+
+            auto* state = reinterpret_cast<SharedState*>(context);
+
+            // Hold the lock only long enough to copy the coefficients in; aSeeVR_start() is
+            // called below without it held. If aSeeVR_start() ever turns out to deliver another
+            // SDK callback (state/eye_data/coefficient) synchronously on this same thread, that
+            // callback would also need state->mutex, and calling aSeeVR_start() while already
+            // holding it would deadlock.
+            aSeeVRCoefficient coefficients;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->coefficients = *data;
+                coefficients = state->coefficients;
+            }
+
+            const auto status = aSeeVR_start(&coefficients);
+
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (status == ASEEVR_RETURN_CODE::success) {
+                state->isDeviceReady = true;
+            } else {
+                Log("aSeeVR_start failed with: %d\n", status);
+            }
+        }
+    };
 
 } // namespace
 
@@ -294,6 +551,16 @@ namespace toolkit::input {
     std::shared_ptr<IEyeTracker> CreateEyeTracker(toolkit::OpenXrApi& openXR,
                                                   std::shared_ptr<toolkit::config::IConfigManager> configManager) {
         return std::make_shared<OpenXrEyeTracker>(openXR, configManager);
+    }
+
+    std::shared_ptr<IEyeTracker> CreateEyeTrackerFB(toolkit::OpenXrApi& openXR,
+                                                    std::shared_ptr<toolkit::config::IConfigManager> configManager) {
+        return std::make_shared<OpenXrFBEyeTracker>(openXR, configManager);
+    }
+
+    std::shared_ptr<IEyeTracker> CreatePimaxEyeTracker(toolkit::OpenXrApi& openXR,
+                                                       std::shared_ptr<toolkit::config::IConfigManager> configManager) {
+        return std::make_shared<PimaxEyeTracker>(openXR, configManager);
     }
 
 } // namespace toolkit::input

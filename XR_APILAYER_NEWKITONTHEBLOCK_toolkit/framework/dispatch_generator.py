@@ -47,7 +47,7 @@ if 'xrCreateInstance' in layer_apis.requested_functions:
 
 if 'xrDestroyInstance' in layer_apis.override_functions:
     raise Exception("xrDestroyInstance() is implicitly overriden and shall not be specified in override_functions. Use the OpenXrApi destructor instead.")
-if 'xrCreateInstance' in layer_apis.requested_functions:
+if 'xrDestroyInstance' in layer_apis.requested_functions:
     raise Exception("xrDestroyInstance() cannot be specified in requested_functions")
 
 if 'xrGetInstanceProcAddr' in layer_apis.override_functions:
@@ -66,6 +66,7 @@ class DispatchGenOutputGenerator(AutomaticSourceOutputGenerator):
         copyright = '''// MIT License
 //
 // Copyright(c) 2021-2022 Matthieu Bucchianeri
+// Copyright(c) 2026      Tsevopolus
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this softwareand associated documentation files(the "Software"), to deal
@@ -185,6 +186,11 @@ namespace LAYER_NAMESPACE
 	}}
 '''
                 else:
+                    # Dead in practice today - every current OpenXR command returns XrResult, so
+                    # this branch is never emitted - but kept for forward compatibility and made
+                    # consistent with the XrResult branch above (std::exception, not the narrower
+                    # std::runtime_error) so a future non-XrResult command doesn't silently let a
+                    # different exception type escape through this C ABI boundary.
                     generated += f'''
 	void {cur_cmd.name}({parameters_list})
 	{{
@@ -195,7 +201,7 @@ namespace LAYER_NAMESPACE
 		{{
 			LAYER_NAMESPACE::GetInstance()->{cur_cmd.name}({arguments_list});
 		}}
-		catch (std::runtime_error& exc)
+		catch (std::exception& exc)
 		{{
 			TraceLoggingWriteTagged(local, "{cur_cmd.name}_Error", TLArg(exc.what(), "Error"));
 			Log("{cur_cmd.name}: %s\\n", exc.what());
@@ -204,7 +210,7 @@ namespace LAYER_NAMESPACE
 		TraceLoggingWriteStop(local, "{cur_cmd.name}");
 	}}
 '''
-                
+
         return generated
 
     def genCreateInstance(self):
@@ -237,11 +243,26 @@ namespace LAYER_NAMESPACE
     def genGetInstanceProcAddr(self):
         generated = '''	XrResult OpenXrApi::xrGetInstanceProcAddr(XrInstance instance, const char* name, PFN_xrVoidFunction* function)
 	{
+		// m_xrGetInstanceProcAddr is only set once SetGetInstanceProcAddr() runs, at the end of
+		// xrCreateApiLayerInstance(). It is reachable null here: the free xrGetInstanceProcAddr()
+		// in dispatch.cpp forwards into this singleton (lazily default-constructed by
+		// GetInstance() on first use) for *any* call, including one the loader or another layer
+		// makes with XR_NULL_HANDLE to query global functions before our instance exists yet -
+		// a legitimate call per spec. Calling through a null function pointer would otherwise
+		// crash.
+		if (!m_xrGetInstanceProcAddr)
+		{
+			return XR_ERROR_HANDLE_INVALID;
+		}
+
 		XrResult result = m_xrGetInstanceProcAddr(instance, name, function);
 
 		if (XR_SUCCEEDED(result))
 		{
-			const std::string apiName(name);
+			// This runs on every function an application resolves - often repeatedly - so avoid
+			// the heap allocation a std::string would do here on every single call; string_view
+			// comparison against the literals below is allocation-free.
+			const std::string_view apiName(name);
 
 			if (apiName == "xrDestroyInstance")
 			{
@@ -312,9 +333,9 @@ namespace LAYER_NAMESPACE
 			m_instance = instance;
 		}
 
-		void SetUpstreamLayers(std::vector<std::string>& upstreamLayers)
+		void SetUpstreamLayers(std::vector<std::string> upstreamLayers)
 		{
-			m_upstreamLayers = upstreamLayers;
+			m_upstreamLayers = std::move(upstreamLayers);
 		}
 
 		const std::vector<std::string>& GetUpstreamLayers() const
@@ -350,23 +371,50 @@ namespace LAYER_NAMESPACE
     def genVirtualMethods(self):
         generated = ''
 
-        commands_to_include = list(set(layer_apis.override_functions + layer_apis.requested_functions + ['xrDestroyInstance']))
+        # Dedup while preserving order (dict.fromkeys, not set()): a set's iteration order depends
+        # on string hashing, which can vary between interpreter runs (unless PYTHONHASHSEED is
+        # pinned), so generating from a set reordered dispatch.gen.h's virtual methods on every
+        # regeneration - noisy diffs and non-reproducible builds for no reason.
+        commands_to_include = list(dict.fromkeys(
+            layer_apis.override_functions + layer_apis.requested_functions + ['xrDestroyInstance']))
+        # genCreateInstance() resolves core_commands with CHECK_XRCMD (so m_<cmd> is guaranteed
+        # non-null once xrCreateInstance succeeds) but explicitly allows ext_commands to resolve
+        # to null ("Functions from extensions are allowed to be null" - e.g. a runtime can report
+        # an extension as supported without exporting every one of its entry points). The wrapper
+        # for an ext_command therefore needs a null guard that a core command's wrapper doesn't.
+        ext_command_names = set(cmd.name for cmd in self.ext_commands)
         for cur_cmd in self.core_commands + self.ext_commands:
             if cur_cmd.name in commands_to_include:
                 parameters_list = self.makeParametersList(cur_cmd)
                 arguments_list = self.makeArgumentsList(cur_cmd)
+                is_optional = cur_cmd.name in ext_command_names
 
                 generated += '''
 	public:'''
 
                 if cur_cmd.return_type is not None:
-                    generated += f'''
+                    if is_optional:
+                        generated += f'''
+		virtual XrResult {cur_cmd.name}({parameters_list})
+		{{
+			if (!m_{cur_cmd.name})
+			{{
+				return XR_ERROR_FUNCTION_UNSUPPORTED;
+			}}
+			return m_{cur_cmd.name}({arguments_list});
+		}}
+'''
+                    else:
+                        generated += f'''
 		virtual XrResult {cur_cmd.name}({parameters_list})
 		{{
 			return m_{cur_cmd.name}({arguments_list});
 		}}
 '''
                 else:
+                    # Dead in practice today (see the matching note in genWrappers): no current
+                    # OpenXR command has a void return, so there's no way to signal "unsupported"
+                    # here even for an optional ext_command - left as-is.
                     generated += f'''
 		virtual void {cur_cmd.name}({parameters_list})
 		{{
@@ -381,7 +429,14 @@ namespace LAYER_NAMESPACE
         return generated
 
 def makeREstring(strings, default=None):
-    """Turn a list of strings into a regexp string matching exactly those strings."""
+    """Turn a list of strings into a regexp string matching exactly those strings.
+
+    Note the `strings` empty / `default=None` case: this falls through to building the pattern
+    from an empty list, i.e. '^()$', which matches only the empty string - not "match nothing",
+    which is probably what a caller relying on `default=None` here would expect. This currently
+    only ever gets called with a non-empty `extensions_to_search`, so it doesn't bite in
+    practice, but it's a footgun for any future caller that passes an empty list with no default.
+    """
     if strings or default is None:
         return '^(' + '|'.join((re.escape(s) for s in strings)) + ')$'
     return default
