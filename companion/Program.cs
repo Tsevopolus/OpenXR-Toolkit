@@ -24,6 +24,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Security.Principal;
@@ -129,8 +130,14 @@ namespace companion
                                         throw new Exception("Must specify a value for argument " + arg);
                                     }
 
+                                    string rawValue = args[++i].Trim().ToLower();
+                                    if (string.IsNullOrEmpty(rawValue))
+                                    {
+                                        throw new Exception("Must specify a non-empty value for argument " + arg);
+                                    }
+
                                     name = p.Regkey;
-                                    value = p.ParseArg(args[++i].Trim().ToLower(), p);
+                                    value = p.ParseArg(rawValue, p);
                                     break;
                                 }
                             }
@@ -175,7 +182,9 @@ namespace companion
             new ArgParser("world-scale", "world_scale", parseSettingValue, dumpSettingValue, 1000, 1, 10000, 10),
             new ArgParser("zoom", "zoom", parseSettingValue, dumpSettingValue, 10, 10, 1500, 10),
             new ArgParser("frame-throttling", "frame_throttle", parseSettingValue, dumpSettingValue, 120, 15, 120),
-            new ArgParser("reprojection-rate", "motion_reprojection_rate", parseMotionReprojectionRate, dumpMotionReprojectionRate, 0, 0, 3),
+            // Values are 1 ("unlocked") through 4 ("1/4") - there is no "off"/0 state (see
+            // parseMotionReprojectionRate/dumpMotionReprojectionRate below).
+            new ArgParser("reprojection-rate", "motion_reprojection_rate", parseMotionReprojectionRate, dumpMotionReprojectionRate, 1, 1, 4),
             new ArgParser("over-prediction-reduction", "prediction_dampen", parsePredictionDampenValue, dumpPredictionDampenValue, 100, -100, 0),
             new ArgParser("foveated-rendering", "vrs", parseToggle),
             new ArgParser("overlay", "overlay", parseToggle),
@@ -185,7 +194,10 @@ namespace companion
 
         private static int parseSettingValue(string value, ArgParser arg)
         {
-            // Special cases for bool.
+            // Special cases for bool. Currently dead code - no entry in "parser" above
+            // combines Min=0/Max=1/Scale=1 with parseSettingValue (toggles use parseToggle
+            // instead) - kept as a ready-made fallback for a future bool-valued setting
+            // that should use this parser rather than parseToggle.
             if (arg.Min == 0 && arg.Max == 1 && arg.Scale == 1)
             {
                 if (value == "on" || value == "true")
@@ -205,7 +217,9 @@ namespace companion
             // Detect absolute or relative.
             bool increaseBy = value[0] == '+';
             value = value.Substring(increaseBy ? 1 : 0);
-            int v = arg.Scale == 1 ? int.Parse(value) : (int)(float.Parse(value) * arg.Scale + float.Epsilon);
+            int v = arg.Scale == 1
+                ? int.Parse(value, CultureInfo.InvariantCulture)
+                : (int)(float.Parse(value, CultureInfo.InvariantCulture) * arg.Scale + float.Epsilon);
             if (increaseBy)
             {
                 v += (int)key.GetValue(arg.Regkey, arg.Default);
@@ -213,6 +227,16 @@ namespace companion
 
             // Clamp.
             return Math.Min(Math.Max(v, arg.Min), arg.Max);
+        }
+
+        // Wraps a "+N" cycle step around the enum range [min, max] (inclusive), handling
+        // negative steps correctly (C#'s % keeps the sign of the dividend, so a naive
+        // "x % range" can go negative - this double-mod pattern avoids that).
+        private static int WrapCycle(int step, int current, int min, int max)
+        {
+            int range = max - min + 1;
+            int offset = ((current - min + step) % range + range) % range;
+            return min + offset;
         }
 
         private static string dumpSettingValue(ArgParser arg, int value)
@@ -225,7 +249,9 @@ namespace companion
             // Support "cycling" through.
             if (value[0] == '+')
             {
-                return (int.Parse(value.Substring(1)) + (int)key.GetValue(arg.Regkey, arg.Default)) % (arg.Max + 1);
+                int step = int.Parse(value.Substring(1), CultureInfo.InvariantCulture);
+                int current = (int)key.GetValue(arg.Regkey, arg.Default);
+                return WrapCycle(step, current, arg.Min, arg.Max);
             }
 
             return value switch
@@ -253,7 +279,9 @@ namespace companion
             // Support "cycling" through.
             if (value[0] == '+')
             {
-                return (int.Parse(value.Substring(1)) + (int)key.GetValue(arg.Regkey, arg.Default)) % (arg.Max + 1);
+                int step = int.Parse(value.Substring(1), CultureInfo.InvariantCulture);
+                int current = (int)key.GetValue(arg.Regkey, arg.Default);
+                return WrapCycle(step, current, arg.Min, arg.Max);
             }
 
             return value switch
@@ -283,7 +311,9 @@ namespace companion
             // Support "cycling" through.
             if (value[0] == '+')
             {
-                return (int.Parse(value.Substring(1)) + (int)key.GetValue(arg.Regkey, arg.Default)) % (arg.Max + 1);
+                int step = int.Parse(value.Substring(1), CultureInfo.InvariantCulture);
+                int current = (int)key.GetValue(arg.Regkey, arg.Default);
+                return WrapCycle(step, current, arg.Min, arg.Max);
             }
 
             return value switch
@@ -314,7 +344,7 @@ namespace companion
             // Detect absolute or relative.
             bool increaseBy = value[0] == '+';
             value = value.Substring(increaseBy ? 1 : 0);
-            int v = int.Parse(value);
+            int v = int.Parse(value, CultureInfo.InvariantCulture);
             if (increaseBy)
             {
                 v += (int)key.GetValue(arg.Regkey, arg.Default) - 100;

@@ -14,9 +14,18 @@ namespace companion
         /// <param name="disposing">true if managed resources should be disposed; otherwise, false.</param>
         protected override void Dispose(bool disposing)
         {
-            if (disposing && (components != null))
+            if (disposing)
             {
-                components.Dispose();
+                if (components != null)
+                {
+                    components.Dispose();
+                }
+
+                // Not owned by the designer's "components" container (it's created lazily
+                // in Form1.cs), so it needs disposing here explicitly - otherwise its Tick
+                // handler keeps capturing "this" and the timer (and the form) alive after
+                // the form itself is disposed.
+                layerRefreshTimer?.Dispose();
             }
             base.Dispose(disposing);
         }
@@ -67,8 +76,6 @@ namespace companion
             this.label14 = new System.Windows.Forms.Label();
             this.screenshotEye = new System.Windows.Forms.ComboBox();
             this.timer1 = new System.Windows.Forms.Timer(this.components);
-            this.backgroundWorker1 = new System.ComponentModel.BackgroundWorker();
-            this.backgroundWorker2 = new System.ComponentModel.BackgroundWorker();
             this.layerSelector = new System.Windows.Forms.ComboBox();
             this.layerSelectorlabel = new System.Windows.Forms.Label();
             this.pictureBox1 = new System.Windows.Forms.PictureBox();
@@ -467,9 +474,13 @@ namespace companion
             // 
             this.layerSelector.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
             this.layerSelector.FormattingEnabled = true;
+            // The fork entry is deliberately version-agnostic text, not a literal "1.4.3" -
+            // Form1.SetActiveString() derives the actual running fork version dynamically
+            // from the assembly version (OwnVersionString()), so a hardcoded number here
+            // would silently drift out of sync on the next version bump.
             this.layerSelector.Items.AddRange(new object[] {
-            " OpenXR Toolkit 1.3.2 (original)",
-            " OpenXR Toolkit 1.4.2 (NewKitOnTheBlock fork)"});
+            "OpenXR Toolkit 1.3.2 (original)",
+            "OpenXR Toolkit (NewKitOnTheBlock fork)"});
             this.layerSelector.Location = new System.Drawing.Point(25, 309);
             this.layerSelector.Name = "layerSelector";
             this.layerSelector.Size = new System.Drawing.Size(687, 32);
@@ -599,8 +610,6 @@ namespace companion
         private System.Windows.Forms.Label label14;
         private System.Windows.Forms.ComboBox screenshotEye;
         private System.Windows.Forms.Timer timer1;
-        private System.ComponentModel.BackgroundWorker backgroundWorker1;
-        private System.ComponentModel.BackgroundWorker backgroundWorker2;
         private System.Windows.Forms.ComboBox layerSelector;
         private System.Windows.Forms.Label layerSelectorlabel;
         private System.Windows.Forms.Label label3;

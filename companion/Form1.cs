@@ -23,11 +23,8 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Data;
 using System.Drawing;
-using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.IO;
 using Silk.NET.Core;
@@ -60,6 +57,23 @@ namespace companion
 
         private int keyMenuGen = 1;
 
+        // appList entry: keeps the actual registry subkey name (RegistryName) separate from
+        // the text shown in the list (ToString()), so looking up which app was (un)checked
+        // never has to re-derive the name by parsing the display text.
+        private class AppListEntry
+        {
+            public AppListEntry(string registryName, string display)
+            {
+                RegistryName = registryName;
+                Display = display;
+            }
+
+            public string RegistryName { get; }
+            public string Display { get; }
+
+            public override string ToString() => Display;
+        }
+
         public Form1()
         {
             InitializeComponent();
@@ -70,7 +84,8 @@ namespace companion
             InitializeKeyList(rightKey);
             InitializeKeyList(screenshotKey);
 
-            InitXr();
+            InitXrVersionString();
+            InitXrLayersAsync();
             timer1_Tick(null, null);
 
             SuspendLayout();
@@ -83,10 +98,17 @@ namespace companion
                 keyMenuGen = (int)key.GetValue("key_menu_gen", 1);
                 safemodeCheckbox.Checked = (int)key.GetValue("safe_mode", 0) == 1 ? true : false;
                 screenshotCheckbox.Checked = (int)key.GetValue("enable_screenshot", 0) == 1 ? true : false;
-                screenshotFormat.SelectedIndex = (int)key.GetValue("screenshot_fileformat", 1);
-                screenshotFormat.Enabled = screenshotCheckbox.Enabled && screenshotCheckbox.Checked;
-                screenshotEye.SelectedIndex = (int)key.GetValue("screenshot_eye", 0);
-                menuVisibility.SelectedIndex = (int)key.GetValue("menu_eye", 0);
+                // Clamp registry-sourced indices to the actual item range: a value left over
+                // from an older build with fewer choices (or a corrupted/hand-edited registry
+                // value) would otherwise throw ArgumentOutOfRangeException here and abort the
+                // rest of the constructor.
+                screenshotFormat.SelectedIndex = ClampIndex((int)key.GetValue("screenshot_fileformat", 1), screenshotFormat.Items.Count);
+                // Both share the same enable condition; set together so screenshotEye isn't
+                // left at the designer default (enabled) until the async layer probe below
+                // gets around to calling ApplyXrLayerProbeResult.
+                screenshotFormat.Enabled = screenshotEye.Enabled = screenshotCheckbox.Enabled && screenshotCheckbox.Checked;
+                screenshotEye.SelectedIndex = ClampIndex((int)key.GetValue("screenshot_eye", 0), screenshotEye.Items.Count);
+                menuVisibility.SelectedIndex = ClampIndex((int)key.GetValue("menu_eye", 0), menuVisibility.Items.Count);
                 ctrlModifierCheckbox.Checked = (int)key.GetValue("ctrl_modifier", 1) == 1 ? true : false;
                 altModifierCheckbox.Checked = (int)key.GetValue("alt_modifier", 0) == 1 ? true : false;
                 SelectKey(leftKey, (int)key.GetValue("key_left", KeyInterop.VirtualKeyFromKey(Key.F1)));
@@ -108,13 +130,20 @@ namespace companion
                         displayName += " (" + Path.GetFileName(modulePath) + ")";
                     }
 
-                    appList.Items.Add(displayName);
+                    // Keep the actual registry subkey name attached to the list entry
+                    // (AppListEntry.ToString() is what the list box displays) instead of
+                    // re-deriving it later by splitting the display text on '(' - which
+                    // breaks for any app name that itself contains a parenthesis.
+                    appList.Items.Add(new AppListEntry(subKey, displayName));
                     appList.SetItemChecked(appList.Items.Count - 1, (int)app.GetValue("bypass", 0) == 0);
                 }
             }
             catch (Exception)
             {
-                MessageBox.Show(this, "Failed to write to registry. Please make sure the app is running elevated.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                // This block both reads existing settings and (via CreateSubKey) opens the
+                // key for write, so a failure here isn't necessarily a write failure -
+                // keep the message generic rather than specifically blaming "write".
+                MessageBox.Show(this, "Failed to load settings from the registry. Please make sure the app is running elevated.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
@@ -128,6 +157,17 @@ namespace companion
             CheckForUpdates();
 
             loading = false;
+        }
+
+        // Clamps a registry-sourced ComboBox index into the valid [0, itemCount-1] range
+        // (or -1/no selection if the box has no items at all).
+        private static int ClampIndex(int value, int itemCount)
+        {
+            if (itemCount <= 0)
+            {
+                return -1;
+            }
+            return Math.Min(Math.Max(value, 0), itemCount - 1);
         }
 
         private void InitializeKeyList(ComboBox box)
@@ -164,7 +204,10 @@ namespace companion
                         Key.D9 => "9",
                         Key.Divide => "NumPad/",
                         Key.Multiply => "NumPad*",
-                        Key.OemBackslash => "\\",
+                        // Key.OemBackslash, Key.OemQuestion and Key.Snapshot are not in
+                        // "allowed" above, so there are deliberately no cases for them here -
+                        // add the key to "allowed" first if one of these should become
+                        // selectable.
                         Key.OemCloseBrackets => "]",
                         Key.OemComma => ",",
                         Key.OemMinus => "-",
@@ -172,13 +215,11 @@ namespace companion
                         Key.OemPeriod => ".",
                         Key.OemPipe => "|",
                         Key.OemPlus => "+",
-                        Key.OemQuestion => "?",
                         Key.OemQuotes => "\"",
                         Key.OemSemicolon => ";",
                         Key.OemTilde => "~",
                         Key.Scroll => "ScrLk",
                         Key.Separator => "/",
-                        Key.Snapshot => "PrntScrn",
                         Key.Subtract => "NumPad-",
                         _ => key.ToString()
                     };
@@ -220,16 +261,27 @@ namespace companion
             }
         }
 
-        // Set by the layer-enumeration loop in InitXr()/the periodic re-check, to whichever
-        // of the two layer names EnumerateApiLayerProperties() actually reported as loaded.
+        // Set by ApplyXrLayerProbeResult(), to whichever of the two layer names
+        // EnumerateApiLayerProperties() actually reported as loaded.
         string activeLayerName = null;
+
+        // This companion's own AssemblyFileVersion (see AssemblyInfo.cs), kept in lockstep
+        // with version.info by the release process. Used both for the "active layer" label
+        // and the update check below - the NewKitOnTheBlock fork doesn't export a
+        // getVersionString() of its own (that DllImport is fixed to the original 1.3.2
+        // DLL), so this is the only reliable source for "which fork version is this".
+        private static string OwnVersionString()
+        {
+            var v = Assembly.GetExecutingAssembly().GetName().Version;
+            return v.Major + "." + v.Minor + "." + v.Build;
+        }
 
         private void SetActiveString()
         {
             string friendlyName;
             if (activeLayerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit")
             {
-                friendlyName = "OpenXR Toolkit 1.4.2 (NewKitOnTheBlock)";
+                friendlyName = "OpenXR Toolkit " + OwnVersionString() + " (NewKitOnTheBlock)";
             }
             else if (activeLayerName == "XR_APILAYER_MBUCCHIA_toolkit")
             {
@@ -255,7 +307,7 @@ namespace companion
         string versionString = null;
         string updateAvailable = null;
 
-        private unsafe void InitXr()
+        private void InitXrVersionString()
         {
             try
             {
@@ -265,11 +317,32 @@ namespace companion
             catch (Exception)
             {
                 // Not fatal: this only queries the original build's version string
-                // specifically (it's a fixed DllImport target), and SetActiveString()
-                // already falls back to the layer name itself when this is unavailable -
-                // which is what actually distinguishes fork vs. original in the UI.
+                // specifically (it's a fixed DllImport target). SetActiveString() uses
+                // OwnVersionString() for the fork and only falls back to this value when
+                // neither known layer name matched (some third, unexpected layer).
                 versionString = null;
             }
+        }
+
+        // Result of probing the OpenXR loader for installed/active API layers. Carries no
+        // UI state so it can be produced off the UI thread (see InitXrLayersAsync below).
+        private struct XrLayerProbeResult
+        {
+            public bool querySucceeded;
+            public bool layerFound;
+            public string activeLayerName;
+            public string layersList;
+        }
+
+        // Creates a throwaway AppDomain, loads a fresh copy of the OpenXR loader into it (so
+        // the registry's implicit-API-layer list is re-read every time instead of once per
+        // process), enumerates the installed layers, then tears the domain down again. This
+        // is the slow part: AppDomain creation/teardown under .NET Framework commonly takes
+        // several hundred milliseconds, which is why it must not run on the UI thread during
+        // startup (see InitXrLayersAsync). Touches no UI controls - safe to call from any thread.
+        private unsafe XrLayerProbeResult ProbeXrLayers()
+        {
+            var result = new XrLayerProbeResult();
 
             AppDomain dom = AppDomain.CreateDomain("temporaryXr");
             try
@@ -293,8 +366,8 @@ namespace companion
                 var layersSpan = new Span<ApiLayerProperties>(layers);
                 if (xr.EnumerateApiLayerProperties(ref layerCount, layersSpan) == Result.Success)
                 {
-                    bool found = false;
-                    activeLayerName = null;
+                    result.querySucceeded = true;
+
                     string layersList = "";
                     for (int i = 0; i < layers.Length; i++)
                     {
@@ -304,59 +377,124 @@ namespace companion
                             layersList += layerName + "\n";
                             if (layerName == "XR_APILAYER_MBUCCHIA_toolkit" || layerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit")
                             {
-                                found = true;
-                                activeLayerName = layerName;
+                                result.layerFound = true;
+                                result.activeLayerName = layerName;
                             }
                         }
                     }
-
-                    tooltip.SetToolTip(layerActive, layersList);
-
-                    bool wasLoading = loading;
-                    if (!found)
-                    {
-                        layerActive.Text = "OpenXR Toolkit layer is NOT active";
-                        layerActive.ForeColor = Color.Red;
-                        loading = true;
-                        disableCheckbox.Checked = true;
-                        loading = wasLoading;
-                    }
-                    else
-                    {
-                        SetActiveString();
-                        layerActive.ForeColor = Color.Green;
-                        loading = true;
-                        disableCheckbox.Checked = false;
-                        // Reflect which of the two layers is actually loaded, independent of
-                        // the disable/enable checkbox above (that one just toggles "any
-                        // toolkit layer at all" on or off).
-                        layerSelector.SelectedIndex = (activeLayerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit") ? 1 : 0;
-                        loading = wasLoading;
-                    }
-                    safemodeCheckbox.Enabled = screenshotCheckbox.Enabled = screenshotFormat.Enabled = screenshotEye.Enabled =
-                        menuVisibility.Enabled = leftKey.Enabled = nextKey.Enabled = previousKey.Enabled = rightKey.Enabled = screenshotKey.Enabled =
-                        ctrlModifierCheckbox.Enabled = altModifierCheckbox.Enabled = layerSelector.Enabled = !disableCheckbox.Checked;
-                    screenshotFormat.Enabled = screenshotCheckbox.Enabled && screenshotCheckbox.Checked;
+                    result.layersList = layersList;
                 }
-                else
-                {
-                    MessageBox.Show(this, "Failed to query API layers", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-            catch (Exception)
-            {
-                MessageBox.Show(this, "Failed to initialize OpenXR", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
                 AppDomain.Unload(dom);
             }
 
-            // Try to reclaim memory.
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
+            return result;
+        }
+
+        // Applies a ProbeXrLayers() result to the UI. Must run on the UI thread.
+        private void ApplyXrLayerProbeResult(XrLayerProbeResult result)
+        {
+            if (!result.querySucceeded)
+            {
+                MessageBox.Show(this, "Failed to query API layers", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            tooltip.SetToolTip(layerActive, result.layersList);
+
+            bool wasLoading = loading;
+            if (!result.layerFound)
+            {
+                activeLayerName = null;
+                layerActive.Text = "OpenXR Toolkit layer is NOT active";
+                layerActive.ForeColor = Color.Red;
+                loading = true;
+                disableCheckbox.Checked = true;
+                loading = wasLoading;
+            }
+            else
+            {
+                activeLayerName = result.activeLayerName;
+                SetActiveString();
+                layerActive.ForeColor = Color.Green;
+                loading = true;
+                disableCheckbox.Checked = false;
+                // Reflect which of the two layers is actually loaded, independent of
+                // the disable/enable checkbox above (that one just toggles "any
+                // toolkit layer at all" on or off).
+                layerSelector.SelectedIndex = (activeLayerName == "XR_APILAYER_NEWKITONTHEBLOCK_toolkit") ? 1 : 0;
+                loading = wasLoading;
+            }
+            safemodeCheckbox.Enabled = screenshotCheckbox.Enabled = screenshotFormat.Enabled = screenshotEye.Enabled =
+                menuVisibility.Enabled = leftKey.Enabled = nextKey.Enabled = previousKey.Enabled = rightKey.Enabled = screenshotKey.Enabled =
+                ctrlModifierCheckbox.Enabled = altModifierCheckbox.Enabled = layerSelector.Enabled = !disableCheckbox.Checked;
+            screenshotFormat.Enabled = screenshotEye.Enabled = screenshotCheckbox.Enabled && screenshotCheckbox.Checked;
+        }
+
+        // Runs ProbeXrLayers() on a background thread (it creates/tears down a throwaway
+        // AppDomain, which is slow - see ProbeXrLayers' own comment) and marshals the result
+        // back onto the UI thread via BeginInvoke, where onComplete runs. onComplete always
+        // runs on the UI thread, with a null result if the probe itself threw.
+        private void RunXrProbeAsync(Action<XrLayerProbeResult?> onComplete)
+        {
+            new Thread(() =>
+            {
+                Thread.CurrentThread.IsBackground = true;
+
+                XrLayerProbeResult? result = null;
+                try
+                {
+                    result = ProbeXrLayers();
+                }
+                catch (Exception)
+                {
+                }
+
+                try
+                {
+                    BeginInvoke(new System.Action(() => onComplete(result)));
+                }
+                catch (Exception)
+                {
+                    // Window may have been closed already while the probe was running.
+                }
+            }).Start();
+        }
+
+        // Fire-and-forget probe-and-apply: applies the result (or shows the same error
+        // MessageBox the old synchronous InitXr() used to) once the background probe
+        // completes. Never blocks the UI thread - use this instead of the old synchronous
+        // InitXr() at every call site.
+        private void InitXrAsync()
+        {
+            RunXrProbeAsync(result =>
+            {
+                if (result.HasValue)
+                {
+                    ApplyXrLayerProbeResult(result.Value);
+                }
+                else
+                {
+                    MessageBox.Show(this, "Failed to initialize OpenXR", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+
+                // Try to reclaim memory.
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            });
+        }
+
+        // Startup path: defers to InitXrAsync() like every other call site. The Handle touch
+        // isn't load-bearing (InitializeComponent()/Show() already force it, and BeginInvoke
+        // queues until the message pump starts regardless) - kept as a cheap, explicit
+        // guarantee rather than relying on that ordering.
+        private void InitXrLayersAsync()
+        {
+            var forceHandle = Handle;
+            InitXrAsync();
         }
 
         private void CheckForUpdates()
@@ -371,6 +509,7 @@ namespace companion
                 HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
                 request.Method = "GET";
                 request.UserAgent = "PimaxXR/Updated";
+                request.Timeout = 5000;
                 try
                 {
                     WebResponse webResponse = request.GetResponse();
@@ -380,20 +519,37 @@ namespace companion
                         string response = responseReader.ReadToEnd();
                         var jsonReader = JsonReaderWriterFactory.CreateJsonReader(Encoding.UTF8.GetBytes(response), new System.Xml.XmlDictionaryReaderQuotas());
                         var root = XElement.Load(jsonReader);
-                        var indexOfV = versionString.LastIndexOf('v');
-                        var ourVersion = versionString.Substring(indexOfV + 1, versionString.Length - indexOfV - 2).Split('.');
-                        string tagName = root.XPathSelectElement("//tag_name").Value;
-                        var githubLatestVersion = tagName.Split('.');
-                        var ourVersionNumber = (int.Parse(ourVersion[0]) << 24) + (int.Parse(ourVersion[1]) << 16) + int.Parse(ourVersion[2]);
-                        var githubLatestVersionNumber = (int.Parse(githubLatestVersion[0]) << 24) + (int.Parse(githubLatestVersion[1]) << 16) + int.Parse(githubLatestVersion[2]);
-                        if (ourVersionNumber < githubLatestVersionNumber)
+                        string tagName = root.XPathSelectElement("//tag_name")?.Value;
+                        if (string.IsNullOrEmpty(tagName))
+                        {
+                            return;
+                        }
+
+                        // Tags are plain "1.4.3" or prefixed "v1.4.3" - strip the prefix if present.
+                        string tagVersionText = tagName.StartsWith("v", StringComparison.OrdinalIgnoreCase)
+                            ? tagName.Substring(1)
+                            : tagName;
+
+                        // Compare against this companion's own version (kept in lockstep with
+                        // version.info), not getVersionString() - that DllImport always reads
+                        // the bundled original 1.3.2 DLL regardless of which layer is active,
+                        // so it never reflects the fork's own version.
+                        var ownVersion = Assembly.GetExecutingAssembly().GetName().Version;
+                        if (Version.TryParse(tagVersionText, out var githubVersion) &&
+                            githubVersion > new Version(ownVersion.Major, ownVersion.Minor, ownVersion.Build))
                         {
                             updateAvailable = tagName;
                         }
                     }
                 }
-                catch (Exception)
+                catch (Exception e)
                 {
+                    // Silently skipping the update check on any failure (network down, GitHub
+                    // rate limit, etc.) is the right call for a release build - it's not worth
+                    // bothering the user about. In a debug build, at least leave a trace.
+#if DEBUG
+                    Debug.WriteLine("CheckForUpdates failed: " + e);
+#endif
                 }
 
             }).Start();
@@ -486,20 +642,31 @@ namespace companion
                 }
             }
 
-            // Re-run the same live check InitXr() does, so layerActive updates without
+            // Re-run the same live check InitXrAsync() does, so layerActive updates without
             // needing a manual re-open of the app. A short delay first: reading the
             // registry back immediately after writing to HKEY_LOCAL_MACHINE can still
             // observe the pre-write value for a brief moment, so we give it a beat.
-            var refreshTimer = new System.Windows.Forms.Timer();
-            refreshTimer.Interval = 400;
-            refreshTimer.Tick += (s2, e2) =>
+            // Reuse a single timer across calls instead of creating a new one on every
+            // dropdown change - otherwise rapidly flipping the selector piles up multiple
+            // independent timers all about to fire.
+            if (layerRefreshTimer == null)
             {
-                refreshTimer.Stop();
-                refreshTimer.Dispose();
-                InitXr();
-            };
-            refreshTimer.Start();
+                layerRefreshTimer = new System.Windows.Forms.Timer();
+                layerRefreshTimer.Interval = 400;
+                layerRefreshTimer.Tick += (s2, e2) =>
+                {
+                    layerRefreshTimer.Stop();
+                    InitXrAsync();
+                };
+            }
+            else
+            {
+                layerRefreshTimer.Stop();
+            }
+            layerRefreshTimer.Start();
         }
+
+        private System.Windows.Forms.Timer layerRefreshTimer;
 
         private void reportIssuesLink_LinkClicked(object sender, LinkLabelLinkClickedEventArgs e)
         {
@@ -576,12 +743,29 @@ namespace companion
 
             var expectedValue = disableCheckbox.Checked;
 
-            InitXr();
-
-            if (!expectedValue && disableCheckbox.Checked != expectedValue)
+            // The post-check below (did the requested state actually take?) used to run
+            // right after a synchronous InitXr() call; now that the probe is async, it has
+            // to move into the completion callback instead.
+            RunXrProbeAsync(result =>
             {
-                MessageBox.Show(this, "Failed to activate OpenXR Toolkit. This can happen when incompatible software is installed or system dependencies are missing", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+                if (result.HasValue)
+                {
+                    ApplyXrLayerProbeResult(result.Value);
+                }
+                else
+                {
+                    MessageBox.Show(this, "Failed to initialize OpenXR", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                if (!expectedValue && disableCheckbox.Checked != expectedValue)
+                {
+                    MessageBox.Show(this, "Failed to activate OpenXR Toolkit. This can happen when incompatible software is installed or system dependencies are missing", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            });
         }
 
         private void safemodeCheckbox_CheckedChanged(object sender, EventArgs e)
@@ -601,7 +785,7 @@ namespace companion
                 return;
             }
             WriteSetting("enable_screenshot", screenshotCheckbox.Checked ? 1 : 0);
-            screenshotFormat.Enabled = screenshotCheckbox.Checked;
+            screenshotFormat.Enabled = screenshotEye.Enabled = screenshotCheckbox.Checked;
         }
 
         private void menuVisibility_SelectedIndexChanged(object sender, EventArgs e)
@@ -652,6 +836,13 @@ namespace companion
                     if (key.SelectedItem == other.SelectedItem)
                     {
                         MessageBox.Show("Please make the key assignments unique.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                        // Revert to the last valid selection instead of leaving the
+                        // rejected duplicate shown in the box.
+                        var wasLoading = loading;
+                        loading = true;
+                        key.SelectedItem = key.Tag ?? key.Items[0];
+                        loading = wasLoading;
                         return;
                     }
 
@@ -677,6 +868,9 @@ namespace companion
             {
                 WriteSetting(setting, 0);
             }
+
+            // Remember this as the last valid (non-duplicate) selection, for the revert above.
+            key.Tag = key.SelectedItem;
         }
 
 
@@ -891,7 +1085,7 @@ namespace companion
             {
                 return;
             }
-            var app = appList.Items[e.Index].ToString().Split('(')[0].Trim();
+            var app = ((AppListEntry)appList.Items[e.Index]).RegistryName;
             Microsoft.Win32.RegistryKey key = null;
             try
             {
@@ -941,8 +1135,11 @@ namespace companion
 
             if (updateAvailable != null)
             {
+                // Capture the version text before clearing the flag - clearing it first
+                // (as before) meant the message below always showed an empty version.
+                var newVersion = updateAvailable;
                 updateAvailable = null;
-                if (MessageBox.Show(this, "A new version of OpenXR Toolkit is available: " + updateAvailable + ".\n\nDo you wish to open the download page?", "New version is available", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                if (MessageBox.Show(this, "A new version of OpenXR Toolkit is available: " + newVersion + ".\n\nDo you wish to open the download page?", "New version is available", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
                 {
                     checkUpdatesLink_LinkClicked(null, null);
                 }
