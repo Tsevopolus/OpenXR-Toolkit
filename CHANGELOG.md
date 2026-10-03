@@ -21,8 +21,16 @@ All notable changes to this fork are documented here. Format loosely follows [Ke
 ### Changed
 - `version.info` bumped to 1.4.3; installer version label and `companion` `AssemblyInfo` updated to match.
 
+### Companion app
+- **Startup delay fixed**: the OpenXR layer probe in `Form1`'s constructor ran a synchronous `AppDomain` create/load/unload (plus forced GC passes) before the window could appear; moved to an async probe (`RunXrProbeAsync`/`InitXrAsync`) that runs in the background and updates the UI once done, used consistently at every call site (startup, layer-selector refresh, disable checkbox).
+- `OnBeforeUninstall` added to `CustomSetupActions.cs` (previously no uninstall cleanup of the two layer registry keys).
+- `reprojection-rate` range corrected (was invalid at its own default/min).
+- Update-check rewritten to compare against companion's own version instead of the bundled original DLL's, with robust parsing; fixed a bug where `updateAvailable` got nulled before being shown in the popup.
+- Culture-invariant number parsing (would've broken on German decimal commas).
+- App-list name parsing cleaned up, index range clamping, duplicate-key-assignment revert, timer disposal, dead code/switch cases removed, and a handful of smaller robustness items.
+
 ### Notes
-Like v1.4.2, this release doesn't change intended toolkit behavior beyond restoring the Pimax/aSeeVR and Meta/FB eye trackers — the rest is a robustness/exception-safety pass, this time in the OpenXR loader/dispatch layer and the screenshot capture path.
+Like v1.4.2, this release doesn't change intended toolkit behavior beyond restoring the Pimax/aSeeVR and Meta/FB eye trackers — the rest is a robustness/exception-safety pass, this time in the OpenXR loader/dispatch layer and the screenshot capture path, plus a companion-app startup fix and review pass.
 
 ## [v1.4.2] – 2026-09-19
 
